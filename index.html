@@ -433,7 +433,7 @@ const PIN_M='2307',PIN_W='1408';
 const CF_MENSUEL=1828;
 const CF_ITEMS=[{k:'qonto',l:'Qonto',a:12},{k:'dougs',l:'Dougs',a:119},{k:'assurance',l:'Assurance Leader',a:497},{k:'ap2m',l:'AP2M Gestion',a:1200}];
 
-let DB={chantiers:[],situations:[],depenses:[],salaires:[],budgets:[],urssaf:[]};
+let DB={chantiers:[],situations:[],depenses:[],salaires:[],budgets:[],urssaf:[],factures:[]};
 let prof=null,selWCh=null,pinBuf='',pinProfil=null;
 let soldeQonto=localStorage.getItem('wec_solde')||'';
 let chargesVal=JSON.parse(localStorage.getItem('wec_cf')||'{}');
@@ -445,13 +445,14 @@ async function sbPost(t,d){try{const r=await fetch(SB_URL+'/rest/v1/'+t,{method:
 async function sbPatch(t,id,d){try{const r=await fetch(SB_URL+'/rest/v1/'+t+'?id=eq.'+encodeURIComponent(id),{method:'PATCH',headers:SBH,body:JSON.stringify(d)});return r.ok;}catch{return false}}
 
 async function loadDB(){
-  const [ch,ve,de,wn,bu,ur]=await Promise.all([
+  const [ch,ve,de,wn,bu,ur,bf]=await Promise.all([
     sbGet('wec_chantiers','order=created_at.asc'),
     sbGet('wec_ventes','order=date_facture.desc'),
     sbGet('wec_depenses','order=date_achat.desc'),
     sbGet('wec_walid_net','order=date_virement.desc'),
     sbGet('wec_budgets','order=created_at.desc'),
     sbGet('wec_urssaf','order=trimestre.asc'),
+    sbGet('wec_budgets_factures','order=num_facture.asc'),
   ]);
   if(ch?.length)DB.chantiers=ch.map(c=>({id:c.id,code:c.code,nom:c.nom,marche:c.marche_ht||0,avenant:c.avenant_ht||0,statut:c.statut||'en_cours',env_gars:c.env_gars||null}));
   if(ve?.length)DB.situations=ve.map(v=>({id:v.id,cid:c2i(v.code_chantier),code_ch:v.code_chantier,date:v.date_facture||'',num:v.numero||'',ht:v.montant_ht||0,paye:v.paye||false,cat:v.categorie||'facture_vente'}));
@@ -459,6 +460,7 @@ async function loadDB(){
   if(wn?.length)DB.salaires=wn.map(w=>({id:w.id,cid:c2i(w.code_chantier),code_ch:w.code_chantier,date:w.date_virement||'',montant:w.montant||0,cat:w.categorie||'walid_net'}));
   if(bu?.length)DB.budgets=bu.map(b=>({...b,cid:c2i(b.code_chantier)}));else DB.budgets=[];
   if(ur?.length)DB.urssaf=ur;else DB.urssaf=[];
+  if(bf?.length)DB.factures=bf;else DB.factures=[];
 }
 function c2i(code){return DB.chantiers.find(c=>c.code===code)?.id||null}
 
@@ -748,6 +750,27 @@ async function saveMouv(){
   renderBord();
 }
 
+// ── CALCUL VENTILATION FACTURES (règle 30%) ──
+function calcFactures(marche,nbFact,S,urssafRegul){
+  const facts=[];
+  const f1CA=Math.round(marche*0.30);
+  const restCA=marche-f1CA;
+  const autN=Math.max(1,nbFact-1);
+  for(let i=0;i<nbFact;i++){
+    const ca=i===0?f1CA:Math.round(restCA/autN);
+    const ratio=marche>0?ca/marche:1/nbFact;
+    const wal=Math.round(S.fw*ratio);
+    const mo=Math.round(S.mo*ratio);
+    const fg=Math.round(S.fg*ratio);
+    const ur=Math.round(S.urssaf*ratio);
+    const fam=Math.round(S.famille*ratio);
+    const reg=i===0?(urssafRegul||0):0;
+    const net=Math.max(0,Math.round(wal*0.75)-fam-reg);
+    facts.push({num:i+1,montant_marche:ca,montant_wal:wal,mo,fg,urssaf:ur,famille:fam,net_perso:net,regul:reg});
+  }
+  return facts;
+}
+
 // ── SIMULATEUR ──
 function renderSim(){
   const marche=parseFloat(document.getElementById('sim-marche')?.value)||0;
@@ -787,35 +810,27 @@ function renderSim(){
     <div style="padding:12px 14px">
       ${!S.ok?`<div style="background:var(--rl);border-radius:var(--ra);padding:10px 12px;color:var(--rd);font-size:12px;font-weight:700;margin-bottom:10px">⚠ Net Walid (${f(S.netTotal)}) insuffisant pour couvrir URSSAF (${f(S.urssaf)}) + famille (${f(S.famille)})</div>`:''}
       <div style="margin-bottom:12px">
-        <div style="font-size:11px;font-weight:700;color:var(--nv);margin-bottom:8px;text-transform:uppercase;letter-spacing:.04em">Ventilation par facture${urssafRegul>0?' — Regul URSSAF absorbee sur F1':''}</div>
-        ${Array.from({length:nbFact},(_,i)=>{
-          const moF=Math.round(S.mo/nbFact);
-          const fgF=Math.round(S.fg/nbFact);
-          const urF=Math.round(S.urssaf/nbFact);
-          const famF=Math.round(S.famille/nbFact);
-          const ntF=Math.round(S.netTotal/nbFact);
-          const walF=Math.round(S.fw/nbFact);
-          const regulCette=i===0?Math.min(urssafRegul,ntF):0;
-          const npF=Math.max(0,ntF-famF-regulCette);
-          const bg=i===0&&urssafRegul>0?'#fff0f0':'var(--gy)';
-          const bdr=i===0&&urssafRegul>0?'border:1px solid var(--rd)':'';
-          const tag=i===0&&urssafRegul>0?' 🔴':'';
-          const regulHtml=regulCette>0?`<span style="grid-column:1/-1">Regul URSSAF : <b style="color:var(--rd)">-${f(regulCette)}</b></span>`:'';
+        <div style="font-size:11px;font-weight:700;color:var(--nv);margin-bottom:8px;text-transform:uppercase;letter-spacing:.04em">Ventilation par facture — F1 = 30% du marche${urssafRegul>0?' · Regul URSSAF sur F1':''}</div>
+        ${calcFactures(marche,nbFact,S,urssafRegul).map(fx=>{
+          const bg=fx.num===1&&urssafRegul>0?'#fff0f0':'var(--gy)';
+          const bdr=fx.num===1&&urssafRegul>0?'border:1px solid var(--rd)':'';
+          const tag=fx.num===1&&urssafRegul>0?' 🔴':'';
+          const regulHtml=fx.regul>0?`<span style="grid-column:1/-1">Regul URSSAF : <b style="color:var(--rd)">-${f(fx.regul)}</b></span>`:'';
           return`<div style="background:${bg};border-radius:var(--ra);padding:10px 12px;margin-bottom:6px;${bdr}">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-              <span style="font-size:12px;font-weight:800;color:var(--nv)">Facture ${i+1}${tag}</span>
-              <span style="font-size:11px;color:var(--t3)">WAL : <b style="color:var(--nv)">${f(walF)}</b></span>
+              <span style="font-size:12px;font-weight:800;color:var(--nv)">Facture ${fx.num}${tag} <span style="font-weight:400;font-size:10px;color:var(--t3)">${f(fx.montant_marche)} client</span></span>
+              <span style="font-size:11px;color:var(--t3)">WAL : <b style="color:var(--nv)">${f(fx.montant_wal)}</b></span>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px;color:var(--t2)">
-              <span>MO ouvriers : <b style="color:var(--or)">${f(moF)}</b></span>
-              <span>Facture GARS : <b style="color:var(--or)">${f(fgF)}</b></span>
-              <span>URSSAF : <b style="color:var(--rd)">${f(urF)}</b></span>
-              <span>Famille : <b style="color:#7c3aed">${f(famF)}</b></span>
+              <span>MO ouvriers : <b style="color:var(--or)">${f(fx.mo)}</b></span>
+              <span>Facture GARS : <b style="color:var(--or)">${f(fx.fg)}</b></span>
+              <span>URSSAF : <b style="color:var(--rd)">${f(fx.urssaf)}</b></span>
+              <span>Famille : <b style="color:#7c3aed">${f(fx.famille)}</b></span>
               ${regulHtml}
             </div>
             <div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center">
               <span style="font-size:11px;color:var(--t2)">Net Walid perso</span>
-              <span style="font-size:13px;font-weight:800;color:${npF>0?'var(--gn)':'var(--t3)'}">${f(npF)}</span>
+              <span style="font-size:13px;font-weight:800;color:${fx.net_perso>0?'var(--gn)':'var(--t3)'}">${f(fx.net_perso)}</span>
             </div>
           </div>`;
         }).join('')}
@@ -837,6 +852,14 @@ async function validerSim(){
   DB.budgets.push({...bud,cid:newC.id});
   const ckB=await sbPost('wec_budgets',bud);
   if(!ckB){DB.chantiers.pop();DB.budgets.pop();alert('Erreur creation budget Supabase — verifie ta connexion.');return}
+  // Sauvegarder les factures détaillées
+  const facts=calcFactures(d.marche,d.nbFact,d,d.urssafRegul||0);
+  for(const fx of facts){
+    const fid='bf'+Date.now()+fx.num;
+    const row={id:fid,budget_id:bud.id,code_chantier:code,num_facture:fx.num,montant_marche:fx.montant_marche,montant_wal:fx.montant_wal,mo:fx.mo,urssaf:fx.urssaf,famille:fx.famille,net_perso:fx.net_perso};
+    DB.factures.push(row);
+    await sbPost('wec_budgets_factures',row);
+  }
   alert('Archive pour '+d.nom+'\nGARS : '+f(d.eg)+' · Famille : '+f(d.famille)+' · Net perso : '+f(d.netPerso));
   window._sim=null;
 }
