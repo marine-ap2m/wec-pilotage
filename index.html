@@ -148,6 +148,16 @@ select option{background:var(--nv2)}
 .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
 .modal-title{font-size:15px;font-weight:800}
 .modal-close{background:none;border:none;color:var(--t2);font-size:22px;cursor:pointer;line-height:1}
+.toast{position:fixed;bottom:88px;left:50%;transform:translateX(-50%) translateY(6px);background:var(--nv3);color:var(--wh);padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:500;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;text-align:center;max-width:88vw;white-space:pre-wrap}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.t-ok{background:#0a2d1a;border:1px solid var(--gn);color:var(--gn)}
+.toast.t-err{background:#3d0a0a;border:1px solid var(--rd);color:var(--rd)}
+.toast.t-warn{background:#2d1a0a;border:1px solid var(--am);color:var(--am)}
+.loader-overlay{display:none;position:fixed;inset:0;background:rgba(13,27,42,.88);z-index:400;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+.loader-overlay.show{display:flex}
+.spin{width:38px;height:38px;border:3px solid var(--bd);border-top-color:var(--or);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.btn-loading{opacity:.6;cursor:not-allowed;pointer-events:none}
 </style>
 </head>
 <body>
@@ -185,6 +195,7 @@ select option{background:var(--nv2)}
     <div class="topbar-brand">WEC Pilotage</div>
     <div class="topbar-user">
       <span id="top-user"></span>
+      <button class="logout" id="btn-refresh" onclick="actualiser()" title="Actualiser les données">↻</button>
       <button class="logout" onclick="deco()">Déconnexion</button>
     </div>
   </div>
@@ -319,14 +330,23 @@ select option{background:var(--nv2)}
   </div>
 </div>
 
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- LOADER -->
+<div class="loader-overlay" id="loader">
+  <div class="spin"></div>
+  <div style="color:var(--t2);font-size:13px;font-weight:600">Chargement...</div>
+</div>
+
 <script>
 // ─── SUPABASE ───
 const SB='https://khsxciivrgwjvhdsbjpy.supabase.co';
 const SK='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtoc3hjaWl2cmd3anZoZHNianB5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ4ODk5MzMsImV4cCI6MjA5MDQ2NTkzM30.TGlPY1jtjN5bF5ecOocENKPmkTNysHQeJK1KLnpVIu8';
 const H={'apikey':SK,'Authorization':'Bearer '+SK};
 async function sbGet(t,q=''){const r=await fetch(`${SB}/rest/v1/${t}?${q}`,{headers:H});return r.ok?r.json():[];}
-async function sbPost(t,d){const r=await fetch(`${SB}/rest/v1/${t}`,{method:'POST',headers:{...H,'Content-Type':'application/json','Prefer':'return=representation'},body:JSON.stringify(d)});if(!r.ok){alert('Erreur : '+(await r.text()));return null;}return r.json();}
-async function sbPatch(t,id,d){const r=await fetch(`${SB}/rest/v1/${t}?id=eq.${id}`,{method:'PATCH',headers:{...H,'Content-Type':'application/json','Prefer':'return=minimal'},body:JSON.stringify(d)});if(!r.ok){const e=await r.json();alert('Erreur : '+JSON.stringify(e));return false;}return true;}
+async function sbPost(t,d){const r=await fetch(`${SB}/rest/v1/${t}`,{method:'POST',headers:{...H,'Content-Type':'application/json','Prefer':'return=representation'},body:JSON.stringify(d)});if(!r.ok){showToast('Erreur d\'enregistrement','err');return null;}return r.json();}
+async function sbPatch(t,id,d){const r=await fetch(`${SB}/rest/v1/${t}?id=eq.${id}`,{method:'PATCH',headers:{...H,'Content-Type':'application/json','Prefer':'return=minimal'},body:JSON.stringify(d)});if(!r.ok){showToast('Erreur de mise à jour','err');return false;}return true;}
 
 // ─── FORMULES VERROUILLÉES ───
 const MATH={
@@ -345,12 +365,40 @@ const MATH={
 let PROFIL='';
 let DB={chantiers:[],budgets:[],factures:[],ventes:[],depenses:[],walid_net:[],urssaf:[]};
 let PIN='';
+let _confirmCb=null;
 
 // ─── UTILS ───
 const f=n=>Math.round(n||0).toLocaleString('fr-FR')+'€';
 const fDate=d=>{if(!d)return'—';const p=d.slice(0,10).split('-');return p.length===3?p[2]+'/'+p[1]+'/'+p[0]:d;};
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,5);
 const g=id=>document.getElementById(id);
+
+function showToast(msg,type='ok',dur=2800){
+  const t=g('toast');
+  t.textContent=msg;
+  t.className='toast t-'+type;
+  void t.offsetWidth;
+  t.classList.add('show');
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.classList.remove('show'),dur);
+}
+
+function confirmDialog(msg,cb){
+  _confirmCb=cb;
+  g('m-titre').textContent='Confirmation';
+  g('m-body').innerHTML=`<p style="font-size:14px;line-height:1.6;margin-bottom:20px;color:var(--t2)">${msg}</p>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-nv" onclick="closeModal()" style="flex:1;margin:0">Annuler</button>
+      <button class="btn" id="confirm-yes" style="flex:1;margin:0;background:#3d0a0a;color:var(--rd);border:1px solid var(--rd)">Confirmer</button>
+    </div>`;
+  g('confirm-yes').onclick=()=>{closeModal();if(_confirmCb)_confirmCb();};
+  g('modal').classList.add('open');
+}
+
+function setBtnLoading(id,loading){
+  const b=g(id);if(!b)return;
+  if(loading)b.classList.add('btn-loading');else b.classList.remove('btn-loading');
+}
 
 // ─── LOGIN ───
 function choixProfil(p){
@@ -361,7 +409,7 @@ function choixProfil(p){
   g('pin-err').classList.add('hidden');
 }
 function retourProfil(){g('psel').classList.remove('hidden');g('pin-wrap').classList.add('hidden');}
-function pk(k){if(PIN.length>=4)return;PIN+=k;g('pin-display').textContent=PIN.replace(/./g,'●').padEnd(4,'_').split('').join(' ');}
+function pk(k){if(PIN.length>=4)return;PIN+=k;g('pin-display').textContent=PIN.replace(/./g,'●').padEnd(4,'_').split('').join(' ');if(PIN.length===4)setTimeout(po,150);}
 function pd(){PIN=PIN.slice(0,-1);g('pin-display').textContent=PIN.replace(/./g,'●').padEnd(4,'_').split('').join(' ');}
 function po(){if(PIN==='2307')lancerApp('marine');else{g('pin-err').classList.remove('hidden');PIN='';g('pin-display').textContent='_ _ _ _';}}
 function deco(){PROFIL='';g('app').style.display='none';g('login').style.display='flex';g('psel').classList.remove('hidden');g('pin-wrap').classList.add('hidden');}
@@ -372,9 +420,26 @@ async function lancerApp(p){
   g('app').style.display='flex';
   g('top-user').textContent=p==='marine'?'Marine — Admin':'Walid — Lecture seule';
   ['nav-m','nav-w','sc-bord','sc-sim','sc-chant','sc-fiche','sc-wc','sc-wr','sc-wd'].forEach(x=>g(x).classList.add('hidden'));
+  g('loader').classList.add('show');
   await charger();
+  g('loader').classList.remove('show');
   if(p==='marine'){g('nav-m').classList.remove('hidden');showM('bord');}
   else{g('nav-w').classList.remove('hidden');showW('wc');}
+}
+
+async function actualiser(){
+  const btn=g('btn-refresh');
+  if(btn)btn.style.opacity='.4';
+  await charger();
+  if(PROFIL==='marine'){
+    const activeId=document.querySelector('#nav-m .bnav.active')?.id?.replace('btn-','');
+    showM(activeId||'bord');
+  } else {
+    const activeId=document.querySelector('#nav-w .bnav.active')?.id?.replace('btn-w','');
+    showW('w'+(activeId||'c'));
+  }
+  if(btn)btn.style.opacity='1';
+  showToast('Données actualisées');
 }
 
 async function charger(){
@@ -502,25 +567,26 @@ async function validerSim(){
   if(!_SIM)return;
   const nom=g('s-nom').value.trim();
   const code=g('s-code').value.trim()||uid();
-  if(!nom){alert('Saisissez le nom du chantier');return;}
-  if(code&&DB.chantiers.some(c=>c.code===code)){alert('Un chantier avec le code '+code+' existe déjà.');return;}
+  if(!nom){showToast('Saisissez le nom du chantier','err');return;}
+  if(code&&DB.chantiers.some(c=>c.code===code)){showToast('Ce code chantier existe déjà','err');return;}
+  setBtnLoading('btn-valider',true);
   const cid=uid();
   const bid=uid();
   const c={id:cid,code,nom,statut:'en_cours',marche_ht:_SIM.marche,avenant_ht:_SIM.av,env_gars:_SIM.eg};
   const r=await sbPost('wec_chantiers',c);
-  if(!r)return;
+  if(!r){setBtnLoading('btn-valider',false);return;}
   const bud={id:bid,code_chantier:code,duree_mois:_SIM.nbf,nb_chantiers_actifs:_SIM.nbc,base_ht:_SIM.base,env_gars_total:_SIM.eg,mo_total:_SIM.mo,fact_gars_total:_SIM.fg,wal_total:_SIM.fw,urssaf_total:_SIM.urs,famille_total:_SIM.fam,net_perso_total:_SIM.np,urssaf_regul:_SIM.regul,valide:true,date_validation:new Date().toISOString().slice(0,10)};
   await sbPost('wec_budgets',bud);
-  for(const fx of _SIM.facts){
+  await Promise.all(_SIM.facts.map(fx=>{
     const u=Math.round(fx.w*0.212);
     const n=Math.max(0,Math.round(fx.w*0.75-fx.fam-fx.reg));
-    await sbPost('wec_budgets_factures',{id:uid(),budget_id:bid,code_chantier:code,num_facture:fx.num,montant_marche:fx.m,montant_wal:fx.w,mo:fx.mo,urssaf:u,famille:fx.fam,net_perso:n});
-  }
+    return sbPost('wec_budgets_factures',{id:uid(),budget_id:bid,code_chantier:code,num_facture:fx.num,montant_marche:fx.m,montant_wal:fx.w,mo:fx.mo,urssaf:u,famille:fx.fam,net_perso:n});
+  }));
   DB.chantiers.unshift(c);DB.budgets.push(bud);
   ['s-nom','s-code','s-marche','s-avenant','s-mo','s-fam'].forEach(x=>g(x).value='');
   g('s-avenant').value='0';g('s-regul').value='0';
   g('sim-preview').classList.add('hidden');g('btn-valider').disabled=true;_SIM=null;
-  alert('Chantier "'+nom+'" créé !');
+  showToast('Chantier "'+nom+'" créé !');
   showM('chant');
 }
 
@@ -806,11 +872,10 @@ async function save(type){
   const cid=g('m-cid')?.value||'';
   if(type==='enc'){
     const amt=parseFloat(g('m-amt').value)||0;
-    if(!amt){alert('Montant requis');return;}
+    if(!amt){showToast('Montant requis','err');return;}
     const num=g('m-num').value.trim();
-    if(!num){alert('N° de facture requis');return;}
-    // Contrôle doublon numéro facture
-    if(DB.ventes.some(v=>v.numero===num)){alert('Ce numéro de facture existe déjà : '+num);return;}
+    if(!num){showToast('N° de facture requis','err');return;}
+    if(DB.ventes.some(v=>v.numero===num)){showToast('Ce numéro de facture existe déjà','err');return;}
     const paye=g('m-paye').value==='true';
     const gars=parseFloat(g('v-gars')?.value)||0;
     const fg=Math.round(gars*0.20);
@@ -821,22 +886,24 @@ async function save(type){
     const net=Math.max(0,Math.round(wal*0.75-fam));
     const row={id:uid(),code_chantier:cid,date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,categorie:'facture_vente',
       ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
-    const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);closeModal();renderBord();if(PROFIL==='marine')renderMvt();}
+    const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);closeModal();renderBord();if(PROFIL==='marine')renderMvt();showToast('Facture enregistrée');}
   } else if(type==='gars'){
-    const mo=parseFloat(g('m-mo').value)||0;if(!mo){alert('Montant requis');return;}
+    const mo=parseFloat(g('m-mo').value)||0;if(!mo){showToast('Montant requis','err');return;}
     const four=g('m-four').value||'GARS';const fg=Math.round(mo*0.20);
-    const r1=await sbPost('wec_depenses',{id:uid(),code_chantier:cid,date_achat:date,fournisseur:four,montant_ht:mo,paye:true,categorie:'gars'});
-    const r2=await sbPost('wec_depenses',{id:uid(),code_chantier:cid,date_achat:date,fournisseur:'Facture GARS',montant_ht:fg,paye:true,categorie:'facture_gars'});
-    if(r1&&r2){DB.depenses.unshift({code_chantier:cid,montant_ht:mo,categorie:'gars'},{code_chantier:cid,montant_ht:fg,categorie:'facture_gars'});closeModal();renderBord();}
+    const [r1,r2]=await Promise.all([
+      sbPost('wec_depenses',{id:uid(),code_chantier:cid,date_achat:date,fournisseur:four,montant_ht:mo,paye:true,categorie:'gars'}),
+      sbPost('wec_depenses',{id:uid(),code_chantier:cid,date_achat:date,fournisseur:'Facture GARS',montant_ht:fg,paye:true,categorie:'facture_gars'}),
+    ]);
+    if(r1&&r2){DB.depenses.unshift({code_chantier:cid,montant_ht:mo,categorie:'gars'},{code_chantier:cid,montant_ht:fg,categorie:'facture_gars'});closeModal();renderBord();showToast('Paiement GARS enregistré');}
   } else if(type==='wal'){
-    const brut=parseFloat(g('m-brut').value)||0;if(!brut){alert('Montant requis');return;}
+    const brut=parseFloat(g('m-brut').value)||0;if(!brut){showToast('Montant requis','err');return;}
     const row={id:uid(),code_chantier:cid,date_virement:date,montant:brut,categorie:g('m-wtype').value};
-    const r=await sbPost('wec_walid_net',row);if(r){DB.walid_net.unshift(row);closeModal();renderBord();}
+    const r=await sbPost('wec_walid_net',row);if(r){DB.walid_net.unshift(row);closeModal();renderBord();showToast('Virement enregistré');}
   } else if(type==='charge'){
     const amt=parseFloat(g('m-amt').value)||0;
     const lib=(g('m-ctype').options[g('m-ctype').selectedIndex].text.split('—')[0]).trim();
     const row={id:uid(),code_chantier:null,date_achat:date,fournisseur:lib,montant_ht:amt,paye:true,categorie:'charge_fixe'};
-    const r=await sbPost('wec_depenses',row);if(r){DB.depenses.unshift(row);closeModal();renderBord();}
+    const r=await sbPost('wec_depenses',row);if(r){DB.depenses.unshift(row);closeModal();renderBord();showToast('Charge enregistrée');}
   }
 }
 
@@ -867,31 +934,31 @@ async function saveModifChantier(cid){
   const marche=parseFloat(g('mc-marche').value)||0;
   const avenant=parseFloat(g('mc-avenant').value)||0;
   const statut=g('mc-statut').value;
-  if(!nom){alert('Nom requis');return;}
+  if(!nom){showToast('Nom requis','err');return;}
   const ok=await sbPatch('wec_chantiers',cid,{nom,code,marche_ht:marche,avenant_ht:avenant,statut});
   if(ok){
     const c=DB.chantiers.find(x=>x.id===cid);
     if(c){c.nom=nom;c.code=code;c.marche_ht=marche;c.avenant_ht=avenant;c.statut=statut;}
-    closeModal();renderChantiers();
+    closeModal();renderChantiers();showToast('Chantier modifié');
   }
 }
 
-async function supprimerChantier(cid,nom){
-  if(!confirm('Supprimer "'+nom+'" et tout son budget ? Irréversible.'))return;
-  const c=DB.chantiers.find(x=>x.id===cid);
-  const code=c?.code||cid;
-  // 1. Supprimer factures budget
-  await fetch(`${SB}/rest/v1/wec_budgets_factures?code_chantier=eq.${code}`,{method:'DELETE',headers:{...H}});
-  // 2. Supprimer budget
-  await fetch(`${SB}/rest/v1/wec_budgets?code_chantier=eq.${code}`,{method:'DELETE',headers:{...H}});
-  // 3. Supprimer chantier
-  const r=await fetch(`${SB}/rest/v1/wec_chantiers?id=eq.${cid}`,{method:'DELETE',headers:{...H}});
-  if(r.ok){
-    DB.chantiers=DB.chantiers.filter(x=>x.id!==cid);
-    DB.budgets=DB.budgets.filter(b=>b.code_chantier!==code);
-    DB.factures=DB.factures.filter(f=>f.code_chantier!==code);
-    renderChantiers();
-  } else {const e=await r.json();alert('Erreur : '+JSON.stringify(e));}
+function supprimerChantier(cid,nom){
+  confirmDialog('Supprimer "'+nom+'" et tout son budget ?<br>Cette action est irréversible.',async()=>{
+    const c=DB.chantiers.find(x=>x.id===cid);
+    const code=c?.code||cid;
+    await Promise.all([
+      fetch(`${SB}/rest/v1/wec_budgets_factures?code_chantier=eq.${code}`,{method:'DELETE',headers:{...H}}),
+      fetch(`${SB}/rest/v1/wec_budgets?code_chantier=eq.${code}`,{method:'DELETE',headers:{...H}}),
+    ]);
+    const r=await fetch(`${SB}/rest/v1/wec_chantiers?id=eq.${cid}`,{method:'DELETE',headers:{...H}});
+    if(r.ok){
+      DB.chantiers=DB.chantiers.filter(x=>x.id!==cid);
+      DB.budgets=DB.budgets.filter(b=>b.code_chantier!==code);
+      DB.factures=DB.factures.filter(f=>f.code_chantier!==code);
+      renderChantiers();showToast('Chantier supprimé','warn');
+    } else {showToast('Erreur de suppression','err');}
+  });
 }
 
 async function changerStatut(cid,statut){
@@ -960,10 +1027,10 @@ async function saveURS(type){
   const trim=g('urs-trim').value.trim();
   const amt=parseFloat(g('urs-amt').value)||0;
   const date=g('urs-date').value;
-  if(!amt){alert('Montant requis');return;}
+  if(!amt){showToast('Montant requis','err');return;}
   const row={id:uid(),type,trimestre:trim,montant:amt,date,date_echeance:date,paye:type==='paiement'};
   const r=await sbPost('wec_urssaf',row);
-  if(r){DB.urssaf.unshift(row);closeModal();renderURS();}
+  if(r){DB.urssaf.unshift(row);closeModal();renderURS();showToast(type==='declaration'?'Déclaration enregistrée':'Paiement enregistré');}
 }
 
 
@@ -1012,16 +1079,17 @@ async function validerEncaissement(vid){
   if(ok){v.paye=true;v.date_paiement=today;renderMvt();renderBord();}
 }
 
-async function supprimerMvt(table,id){
-  if(!table||!id){alert('Impossible de supprimer : données manquantes');return;}
-  if(!confirm('Supprimer ce mouvement ? Action irréversible.'))return;
-  const r=await fetch(`${SB}/rest/v1/${table}?id=eq.${id}`,{method:'DELETE',headers:{...H}});
-  if(r.ok){
-    if(table==='wec_ventes')DB.ventes=DB.ventes.filter(x=>x.id!==id);
-    else if(table==='wec_depenses')DB.depenses=DB.depenses.filter(x=>x.id!==id);
-    else if(table==='wec_walid_net')DB.walid_net=DB.walid_net.filter(x=>x.id!==id);
-    renderMvt();renderBord();
-  } else {const e=await r.json();alert('Erreur : '+JSON.stringify(e));}
+function supprimerMvt(table,id){
+  if(!table||!id){showToast('Impossible de supprimer','err');return;}
+  confirmDialog('Supprimer ce mouvement ?<br>Action irréversible.',async()=>{
+    const r=await fetch(`${SB}/rest/v1/${table}?id=eq.${id}`,{method:'DELETE',headers:{...H}});
+    if(r.ok){
+      if(table==='wec_ventes')DB.ventes=DB.ventes.filter(x=>x.id!==id);
+      else if(table==='wec_depenses')DB.depenses=DB.depenses.filter(x=>x.id!==id);
+      else if(table==='wec_walid_net')DB.walid_net=DB.walid_net.filter(x=>x.id!==id);
+      renderMvt();renderBord();showToast('Mouvement supprimé','warn');
+    } else {showToast('Erreur de suppression','err');}
+  });
 }
 
 function showW(tab){
@@ -1127,13 +1195,14 @@ function toggleFact(id){
 // ─── WALID — VALIDATION ───
 
 // ─── WALID — VALIDATION ───
-async function waliderDevis(cid){
+function waliderDevis(cid){
   const c=DB.chantiers.find(x=>x.id===cid);if(!c)return;
   const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);if(!bud)return;
-  if(!confirm('Tu confirmes avoir lu et accepté ce plan financier ?'))return;
-  const today=new Date().toISOString().slice(0,10);
-  const ok=await sbPatch('wec_budgets',bud.id,{walid_ok:true,date_walid_ok:today});
-  if(ok){bud.walid_ok=true;bud.date_walid_ok=today;ouvrirWD(cid);}
+  confirmDialog('Tu confirmes avoir lu et accepté ce plan financier ?',async()=>{
+    const today=new Date().toISOString().slice(0,10);
+    const ok=await sbPatch('wec_budgets',bud.id,{walid_ok:true,date_walid_ok:today});
+    if(ok){bud.walid_ok=true;bud.date_walid_ok=today;ouvrirWD(cid);showToast('Accord enregistré 👍');}
+  });
 }
 
 // ─── WALID — RÉCAP ───
