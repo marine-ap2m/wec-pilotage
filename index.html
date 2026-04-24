@@ -372,6 +372,36 @@ const f=n=>Math.round(n||0).toLocaleString('fr-FR')+'€';
 const fDate=d=>{if(!d)return'—';const p=d.slice(0,10).split('-');return p.length===3?p[2]+'/'+p[1]+'/'+p[0]:d;};
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,5);
 const g=id=>document.getElementById(id);
+// Toutes les joins passent par code_chantier. On accepte que la valeur stockée soit le code OU l'id (legacy).
+const matchCh=(row,c)=>row&&c&&(row.code_chantier===c.code||row.code_chantier===c.id);
+// Enveloppes budgétaires (depuis wec_budgets)
+function envBud(bud){
+  if(!bud)return null;
+  return{
+    gars:bud.env_gars_total||0,
+    mo:bud.mo_total||0,
+    fact_gars:bud.fact_gars_total||0,
+    wal:bud.wal_total||0,
+    urssaf:bud.urssaf_total||0,
+    famille:bud.famille_total||0,
+    net:bud.net_perso_total||0,
+    treso:bud.provision_charges||(1828*(bud.duree_mois||0)/(bud.nb_chantiers_actifs||1)),
+    base:bud.base_ht||0,
+  };
+}
+// Somme des ventilations déjà consommées sur un chantier (exclut la facture en cours d'édition)
+function consomme(code,excludeId){
+  const list=DB.ventes.filter(v=>v.code_chantier===code&&v.id!==excludeId);
+  return{
+    gars:list.reduce((s,v)=>s+(v.ventil_gars||0),0),
+    fact_gars:list.reduce((s,v)=>s+(v.ventil_fact_gars||0),0),
+    treso:list.reduce((s,v)=>s+(v.ventil_treso||0),0),
+    wal:list.reduce((s,v)=>s+(v.ventil_wal||0),0),
+    urssaf:list.reduce((s,v)=>s+(v.ventil_urssaf||0),0),
+    famille:list.reduce((s,v)=>s+(v.ventil_famille||0),0),
+    net:list.reduce((s,v)=>s+(v.ventil_net||0),0),
+  };
+}
 
 function showToast(msg,type='ok',dur=2800){
   const t=g('toast');
@@ -595,8 +625,8 @@ function renderChantiers(){
   const cont=g('liste-chant');
   if(!DB.chantiers.length){cont.innerHTML='<div class="empty">Aucun chantier.<br>Créez votre premier via le Simulateur.</div>';return;}
   cont.innerHTML=DB.chantiers.map(c=>{
-    const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);
-    const gR=DB.depenses.filter(d=>((d.code_chantier===c.id||d.code_chantier===c.code||d.cid===c.id||d.cid===c.code))&&d.categorie==='gars').reduce((s,d)=>s+d.montant_ht,0);
+    const bud=DB.budgets.find(b=>matchCh(b,c));
+    const gR=DB.depenses.filter(d=>matchCh(d,c)&&d.categorie==='gars').reduce((s,d)=>s+d.montant_ht,0);
     const eg=bud?.env_gars_total||c.env_gars||0;
     const ratio=eg>0?gR/eg:0;
     const feu=ratio>1?'rd':ratio>0.8?'am':'gn';
@@ -621,8 +651,8 @@ function renderChantiers(){
 function ouvrirFiche(cid){
   const c=DB.chantiers.find(x=>x.id===cid);
   if(!c)return;
-  const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);
-  const facts=DB.factures.filter(f2=>f2.code_chantier===c.code||f2.code_chantier===c.id).sort((a,b)=>a.num_facture-b.num_facture);
+  const bud=DB.budgets.find(b=>matchCh(b,c));
+  const facts=DB.factures.filter(f2=>matchCh(f2,c)).sort((a,b)=>a.num_facture-b.num_facture);
   g('fiche-nom').textContent=c.nom;
   const statDict2={'en_cours':'En cours','a_venir':'À venir','termine':'Terminé'};
   g('fiche-meta').innerHTML=(c.code||'')+' · Marché : '+f(c.marche_ht||0)+' · <select onchange="changerStatut(\''+c.id+'\',this.value)" style="background:var(--gy);border:1px solid var(--bd);border-radius:6px;color:var(--wh);font-size:11px;padding:2px 6px"><option value="en_cours" '+(c.statut==='en_cours'?'selected':'')+'>En cours</option><option value="a_venir" '+(c.statut==='a_venir'?'selected':'')+'>À venir</option><option value="termine" '+(c.statut==='termine'?'selected':'')+'>Terminé</option></select>';
@@ -660,9 +690,9 @@ function ouvrirFiche(cid){
       </div>`).join('')}`;
   }
   // Réel
-  const ventes=DB.ventes.filter(v=>(v.code_chantier===c.id||v.code_chantier===c.code||v.cid===c.id||v.cid===c.code));
-  const dep=DB.depenses.filter(d=>(d.code_chantier===c.id||d.code_chantier===c.code||d.cid===c.id||d.cid===c.code));
-  const wal=DB.walid_net.filter(w=>(w.code_chantier===c.id||w.code_chantier===c.code||w.cid===c.id||w.cid===c.code));
+  const ventes=DB.ventes.filter(v=>matchCh(v,c));
+  const dep=DB.depenses.filter(d=>matchCh(d,c));
+  const wal=DB.walid_net.filter(w=>matchCh(w,c));
   const caEnc=ventes.filter(v=>v.paye).reduce((s,v)=>s+v.montant_ht,0);
   const gR=dep.filter(d=>d.categorie==='gars').reduce((s,d)=>s+d.montant_ht,0);
   const fgR=dep.filter(d=>d.categorie==='facture_gars').reduce((s,d)=>s+d.montant_ht,0);
@@ -703,6 +733,32 @@ function ouvrirFiche(cid){
     </div>`;
   };
   const alerteGlobale=resteGars<0||resteFam<0||resteWal<0||resteNet<0;
+  // Liste factures émises avec bouton édition
+  const ventesSorted=[...ventes].sort((a,b)=>(a.date_facture||'')<(b.date_facture||'')?1:-1);
+  const factListHtml=ventesSorted.length?`
+    <div class="card">
+      <div class="card-title">Factures émises (${ventesSorted.length})</div>
+      ${ventesSorted.map(v=>{
+        const statCol=v.paye?'var(--gn)':'var(--am)';
+        const statTxt=v.paye?'✅ Encaissée':'🟠 En attente';
+        return`<div style="background:var(--gy);border:1px solid var(--bd);border-radius:8px;padding:10px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:start;gap:8px">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:800">${v.numero||'Facture'}</div>
+              <div style="font-size:10px;color:var(--t3);margin-top:2px">${fDate(v.date_facture)} · <span style="color:${statCol}">${statTxt}</span></div>
+              <div style="font-size:10px;color:var(--t2);margin-top:6px;line-height:1.5">
+                MO ${f(v.ventil_gars||0)} · Fact.GARS ${f(v.ventil_fact_gars||0)} · Tréso ${f(v.ventil_treso||0)}<br>
+                WAL ${f(v.ventil_wal||0)} · URS ${f(v.ventil_urssaf||0)}${(v.ventil_famille||0)>0?` · Fam ${f(v.ventil_famille)}`:''} · Net <b style="color:var(--gn)">${f(v.ventil_net||0)}</b>
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+              <div style="font-size:14px;font-weight:800;color:var(--or);white-space:nowrap">${f(v.montant_ht)}</div>
+              <button class="btn btn-nv btn-sm" onclick="event.stopPropagation();editVente('${v.id}')" style="padding:4px 8px;font-size:10px;margin:0">✏️ Modifier</button>
+            </div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`:'';
   g('fiche-reel').innerHTML=`
     ${alerteGlobale?`<div class="alerte-box" style="margin-bottom:12px">⚠️ Une ou plusieurs enveloppes sont dépassées sur ce chantier. Ne pas compenser sur d'autres chantiers — voir le détail ci-dessous.</div>`:''}
     <div class="card">
@@ -710,6 +766,7 @@ function ouvrirFiche(cid){
       <div class="row"><span>Factures encaissées</span><b style="color:var(--gn)">${f(caEnc)}</b></div>
       <div class="row"><span>En attente</span><b style="color:var(--am)">${f(ventes.reduce((s,v)=>s+v.montant_ht,0)-caEnc)}</b></div>
     </div>
+    ${factListHtml}
     <div class="card">
       <div class="card-title">Suivi enveloppes — Budget vs Réel</div>
       ${bud?[
@@ -737,27 +794,36 @@ function ficheTab(t){
   g('fiche-reel').classList.toggle('hidden',t!=='reel');
   document.querySelectorAll('.ftab').forEach((el,i)=>el.classList.toggle('active',i===(t==='budget'?0:1)));
 }
+function editVente(id){openModal('enc',id);}
 
 // ─── MODAL SAISIE ───
-function openModal(type){
-  const chOpts=DB.chantiers.filter(c=>c.statut==='en_cours').map(c=>`<option value="${c.code||c.id}">${c.nom}</option>`).join('');
+let _EDIT_VENTE_ID=null;
+function openModal(type,editId){
+  _EDIT_VENTE_ID=(type==='enc'&&editId)?editId:null;
+  const vEdit=_EDIT_VENTE_ID?DB.ventes.find(v=>v.id===_EDIT_VENTE_ID):null;
+  // En mode édition on ne filtre pas par statut (le chantier peut être terminé)
+  const chList=_EDIT_VENTE_ID?DB.chantiers:DB.chantiers.filter(c=>c.statut==='en_cours');
+  const chOpts=chList.map(c=>`<option value="${c.code||c.id}">${c.nom}</option>`).join('');
   const today=new Date().toISOString().slice(0,10);
-  const titres={enc:'Encaissement / Facture',gars:'Paiement GARS',wal:'Virement Walid',charge:'Charge fixe'};
+  const titres={enc:_EDIT_VENTE_ID?'Modifier ventilation':'Encaissement / Facture',gars:'Paiement GARS',wal:'Virement Walid',charge:'Charge fixe'};
   g('m-titre').textContent=titres[type]||'Saisie';
   let html='';
   if(type==='enc'){
-    html=`<div class="form-group"><label>Chantier</label><select id="m-cid" onchange="ventilAuto()">${chOpts}</select></div>
+    const editBanner=_EDIT_VENTE_ID?`<div class="alerte-box" style="margin-bottom:12px;font-size:11px">✏️ Édition d'une facture déjà enregistrée. La modification recalcule les enveloppes restantes pour les factures suivantes.</div>`:'';
+    html=`${editBanner}
+      <div class="form-group"><label>Chantier</label><select id="m-cid" onchange="ventilAuto()" ${_EDIT_VENTE_ID?'disabled':''}>${chOpts}</select></div>
       <div class="form-group"><label>N° facture</label><input type="text" id="m-num" placeholder="F26-0001"></div>
       <div class="form-group"><label>Montant facture HT (€)</label><input type="number" id="m-amt" placeholder="0" oninput="ventilAuto()"></div>
       <div class="form-group"><label>Date</label><input type="date" id="m-date" value="${today}"></div>
       <div class="sep"></div>
       <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:10px">Ventilation de ce montant</div>
-      <div class="form-group"><label>MO terrain — net gars (€)</label><input type="number" id="v-gars" placeholder="0" oninput="ventilCalc()"></div>
+      <div id="v-env-restant" class="hidden" style="background:var(--gy);border-radius:8px;padding:10px;margin-bottom:12px;font-size:11px"></div>
+      <div class="form-group"><label>MO terrain — net gars (€)</label><input type="number" id="v-gars" placeholder="0" oninput="ventilCalc()"><div class="hint" id="v-gars-hint"></div></div>
       <div id="v-fg-row" class="vp hidden" style="margin:-8px 0 10px">
         <div class="vp-row"><span>Facture GARS auto (20%)</span><span id="v-fg-val">—</span></div>
       </div>
-      <div class="form-group"><label>Tréso WEC (€)</label><input type="number" id="v-treso" placeholder="0" oninput="ventilCalc()"></div>
-      <div class="form-group"><label>Famille (€)</label><input type="number" id="v-fam" placeholder="0" oninput="ventilCalc()"></div>
+      <div class="form-group"><label>Tréso WEC (€)</label><input type="number" id="v-treso" placeholder="0" oninput="ventilCalc()"><div class="hint" id="v-treso-hint"></div></div>
+      <div class="form-group"><label>Famille (€)</label><input type="number" id="v-fam" placeholder="0" oninput="ventilCalc()"><div class="hint" id="v-fam-hint"></div></div>
       <div id="v-recap" class="vp hidden">
         <div class="vp-row"><span>WAL Conseils</span><span id="v-wal-val">—</span></div>
         <div class="vp-row"><span>URSSAF (21,2%)</span><span id="v-urs-val">—</span></div>
@@ -765,7 +831,7 @@ function openModal(type){
         <div class="vp-row" id="v-ecart-row"><span>Écart</span><span id="v-ecart-val">—</span></div>
       </div>
       <div class="form-group" style="margin-top:8px"><label>Statut règlement</label><select id="m-paye"><option value="false">En attente règlement</option><option value="true">Encaissée</option></select></div>
-      <button class="btn btn-or" onclick="save('enc')">Enregistrer</button>`;
+      <button class="btn btn-or" onclick="save('enc')">${_EDIT_VENTE_ID?'Enregistrer les modifications':'Enregistrer'}</button>`;
   } else if(type==='gars'){
     html=`<div class="form-group"><label>Chantier</label><select id="m-cid">${chOpts}</select></div>
       <div class="form-group"><label>Fournisseur</label><input type="text" id="m-four" placeholder="Etancheite 33"></div>
@@ -802,28 +868,58 @@ function openModal(type){
   }
   g('m-body').innerHTML=html;
   g('modal').classList.add('open');
-}
-function closeModal(){g('modal').classList.remove('open');}
-function setCharge(){const v=g('m-ctype').value;if(v!=='0')g('m-amt').value=v;}
-function ventilAuto(){
-  // Pré-remplir tréso depuis le budget du chantier sélectionné
-  const cid=g('m-cid')?.value||'';
-  const amt=parseFloat(g('m-amt')?.value)||0;
-  if(!amt)return;
-  const c=DB.chantiers.find(x=>x.code===cid||x.id===cid);
-  const bud=c?DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id):null;
-  if(bud&&bud.duree_mois&&bud.nb_chantiers_actifs){
-    const facts=DB.factures.filter(f2=>f2.code_chantier===(c?.code||cid));
-    const nbFacts=bud.duree_mois||3;
-    const provParFact=Math.round(MATH.provisionCF(nbFacts,bud.nb_chantiers_actifs)/nbFacts);
-    if(!g('v-treso').value)g('v-treso').value=provParFact;
+  if(type==='enc'&&vEdit){
+    if(g('m-cid'))g('m-cid').value=vEdit.code_chantier||'';
+    if(g('m-num'))g('m-num').value=vEdit.numero||'';
+    if(g('m-amt'))g('m-amt').value=vEdit.montant_ht||0;
+    if(g('m-date')&&vEdit.date_facture)g('m-date').value=vEdit.date_facture.slice(0,10);
+    if(g('m-paye'))g('m-paye').value=vEdit.paye?'true':'false';
+    if(g('v-gars'))g('v-gars').value=vEdit.ventil_gars||0;
+    if(g('v-treso'))g('v-treso').value=vEdit.ventil_treso||0;
+    if(g('v-fam'))g('v-fam').value=vEdit.ventil_famille||0;
+    ventilCalc();
   }
+}
+function closeModal(){_EDIT_VENTE_ID=null;g('modal').classList.remove('open');}
+function setCharge(){const v=g('m-ctype').value;if(v!=='0')g('m-amt').value=v;}
+// Helpers ventilation
+function _chSel(){
+  const cid=g('m-cid')?.value||'';
+  return DB.chantiers.find(x=>x.code===cid||x.id===cid)||null;
+}
+function _budSel(){
+  const c=_chSel();return c?DB.budgets.find(b=>matchCh(b,c)):null;
+}
+function ventilAuto(){
+  // Pré-remplir automatiquement selon les enveloppes restantes (pro-rata sur base nette)
+  const amt=parseFloat(g('m-amt')?.value)||0;
+  const c=_chSel();const bud=_budSel();
+  if(!amt||!bud||!c){ventilCalc();return;}
+  const code=c.code||c.id;
+  const env=envBud(bud);const cons=consomme(code,_EDIT_VENTE_ID);
+  // Base restante = base_ht - (gars+fact_gars+treso+wal déjà consommés)
+  const consoBase=cons.gars+cons.fact_gars+cons.treso+cons.wal;
+  const baseRest=Math.max(1,(env.base||0)+(env.treso||0)-consoBase);
+  // Ratio du montant sur base restante totale
+  const r=Math.min(1,amt/baseRest);
+  const sugGars=Math.round(Math.max(0,(env.mo-cons.gars))*r);
+  const sugTreso=Math.round(Math.max(0,(env.treso-cons.treso))*r);
+  const sugFam=Math.round(Math.max(0,(env.famille-cons.famille))*r);
+  if(!g('v-gars').value)g('v-gars').value=sugGars;
+  if(!g('v-treso').value)g('v-treso').value=sugTreso;
+  if(!g('v-fam').value)g('v-fam').value=sugFam;
   ventilCalc();
 }
 
+function _hint(id,reste,budget){
+  const el=g(id);if(!el)return;
+  if(budget<=0){el.textContent='';return;}
+  const col=reste<0?'var(--rd)':(reste<budget*0.2?'var(--am)':'var(--gn)');
+  const txt=reste<0?`⚠️ Dépassement : ${f(Math.abs(reste))} au-dessus de l'enveloppe`:`Reste enveloppe : ${f(reste)} / ${f(budget)}`;
+  el.innerHTML=`<span style="color:${col};font-weight:700">${txt}</span>`;
+}
 function ventilCalc(){
   const amt=parseFloat(g('m-amt')?.value)||0;
-  if(!amt){g('v-recap').classList.add('hidden');g('v-fg-row').classList.add('hidden');return;}
   const gars=parseFloat(g('v-gars')?.value)||0;
   const fg=Math.round(gars*0.20);
   const treso=parseFloat(g('v-treso')?.value)||0;
@@ -832,25 +928,58 @@ function ventilCalc(){
   const urs=Math.round(wal*0.212);
   const net=Math.max(0,Math.round(wal*0.75-fam));
   const ecart=amt-(gars+fg+treso+wal);
+  // Facture GARS auto (20% MO)
   if(gars>0){
     g('v-fg-val').textContent=f(fg);
     g('v-fg-row').classList.remove('hidden');
   } else {
     g('v-fg-row').classList.add('hidden');
   }
-  g('v-wal-val').textContent=f(wal);
-  g('v-urs-val').textContent=f(urs);
-  g('v-net-val').textContent=f(net);
-  const ecartEl=g('v-ecart-val');
-  const ecartRow=g('v-ecart-row');
-  if(Math.abs(ecart)>1){
-    ecartEl.textContent=(ecart>0?'+':'')+f(ecart);
-    ecartEl.style.color=ecart>0?'var(--am)':'var(--rd)';
-    ecartRow.style.display='flex';
+  // Recap
+  if(amt>0){
+    g('v-wal-val').textContent=f(wal);
+    g('v-urs-val').textContent=f(urs);
+    g('v-net-val').textContent=f(net);
+    const ecartEl=g('v-ecart-val');const ecartRow=g('v-ecart-row');
+    if(Math.abs(ecart)>1){
+      ecartEl.textContent=(ecart>0?'+':'')+f(ecart);
+      ecartEl.style.color=ecart>0?'var(--am)':'var(--rd)';
+      ecartRow.style.display='flex';
+    } else {ecartRow.style.display='none';}
+    g('v-recap').classList.remove('hidden');
   } else {
-    ecartRow.style.display='none';
+    g('v-recap').classList.add('hidden');
   }
-  g('v-recap').classList.remove('hidden');
+  // Enveloppes restantes par poste (cascade)
+  const c=_chSel();const bud=_budSel();
+  const box=g('v-env-restant');if(!box)return;
+  if(!bud||!c){box.classList.add('hidden');['v-gars-hint','v-treso-hint','v-fam-hint'].forEach(id=>{const e=g(id);if(e)e.textContent='';});return;}
+  const env=envBud(bud);const cons=consomme(c.code||c.id,_EDIT_VENTE_ID);
+  // Reste = enveloppe - (déjà consommé par autres factures) - montant courant
+  const rGars=env.gars-(cons.gars+cons.fact_gars)-(gars+fg);
+  const rTreso=env.treso-cons.treso-treso;
+  const rFam=env.famille-cons.famille-fam;
+  const rWal=env.wal-cons.wal-wal;
+  const rUrs=env.urssaf-cons.urssaf-urs;
+  const rNet=env.net-cons.net-net;
+  _hint('v-gars-hint',env.mo-cons.gars-gars,env.mo);
+  _hint('v-treso-hint',rTreso,env.treso);
+  _hint('v-fam-hint',rFam,env.famille);
+  // Bloc récap enveloppes
+  const pill=(lab,r,b)=>{
+    if(b<=0)return '';
+    const col=r<0?'var(--rd)':(r<b*0.2?'var(--am)':'var(--gn)');
+    const txt=r<0?`-${f(Math.abs(r))}`:`+${f(r)}`;
+    return`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--bd)"><span style="color:var(--t2)">${lab}</span><span style="color:${col};font-weight:800">${txt}</span></div>`;
+  };
+  box.innerHTML=`<div style="font-weight:800;color:var(--or);margin-bottom:6px;font-size:11px">ENVELOPPES RESTANTES APRÈS CETTE FACTURE</div>
+    ${pill('GARS total (MO + 20%)',rGars,env.gars)}
+    ${pill('Tréso WEC',rTreso,env.treso)}
+    ${pill('WAL Conseils',rWal,env.wal)}
+    ${pill('URSSAF 21,2%',rUrs,env.urssaf)}
+    ${pill('Famille',rFam,env.famille)}
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0"><span style="color:var(--t2);font-weight:700">Net Walid perso</span><span style="color:${rNet<0?'var(--rd)':'var(--gn)'};font-weight:800">${rNet<0?'-':'+'}${f(Math.abs(rNet))}</span></div>`;
+  box.classList.remove('hidden');
 }
 
 function previewGars(){
@@ -875,7 +1004,7 @@ async function save(type){
     if(!amt){showToast('Montant requis','err');return;}
     const num=g('m-num').value.trim();
     if(!num){showToast('N° de facture requis','err');return;}
-    if(DB.ventes.some(v=>v.numero===num)){showToast('Ce numéro de facture existe déjà','err');return;}
+    if(DB.ventes.some(v=>v.numero===num&&v.id!==_EDIT_VENTE_ID)){showToast('Ce numéro de facture existe déjà','err');return;}
     const paye=g('m-paye').value==='true';
     const gars=parseFloat(g('v-gars')?.value)||0;
     const fg=Math.round(gars*0.20);
@@ -884,9 +1013,33 @@ async function save(type){
     const wal=Math.max(0,amt-gars-fg-treso);
     const urs=Math.round(wal*0.212);
     const net=Math.max(0,Math.round(wal*0.75-fam));
-    const row={id:uid(),code_chantier:cid,date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,categorie:'facture_vente',
-      ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
-    const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);closeModal();renderBord();if(PROFIL==='marine')renderMvt();showToast('Facture enregistrée');}
+    // Vérification enveloppes → alerte visuelle (pas de blocage)
+    const c=_chSel();const bud=_budSel();
+    let depassMsg='';
+    if(c&&bud){
+      const env=envBud(bud);const cons=consomme(c.code||c.id,_EDIT_VENTE_ID);
+      const dep=[];
+      if(env.gars>0&&(cons.gars+cons.fact_gars+gars+fg)>env.gars)dep.push('GARS');
+      if(env.wal>0&&(cons.wal+wal)>env.wal)dep.push('WAL');
+      if(env.famille>0&&(cons.famille+fam)>env.famille)dep.push('Famille');
+      if(env.net>0&&(cons.net+net)>env.net)dep.push('Net perso');
+      if(dep.length)depassMsg=`⚠ Dépassement ${dep.join(', ')}`;
+    }
+    if(_EDIT_VENTE_ID){
+      const patch={date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,
+        ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
+      const ok=await sbPatch('wec_ventes',_EDIT_VENTE_ID,patch);
+      if(ok){
+        const v=DB.ventes.find(x=>x.id===_EDIT_VENTE_ID);if(v)Object.assign(v,patch);
+        const cOpen=_chSel();closeModal();renderBord();if(PROFIL==='marine')renderMvt();
+        if(cOpen)ouvrirFiche(cOpen.id);
+        showToast(depassMsg||'Ventilation mise à jour',depassMsg?'warn':'ok');
+      }
+    } else {
+      const row={id:uid(),code_chantier:cid,date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,categorie:'facture_vente',
+        ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
+      const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);closeModal();renderBord();if(PROFIL==='marine')renderMvt();showToast(depassMsg||'Facture enregistrée',depassMsg?'warn':'ok');}
+    }
   } else if(type==='gars'){
     const mo=parseFloat(g('m-mo').value)||0;if(!mo){showToast('Montant requis','err');return;}
     const four=g('m-four').value||'GARS';const fg=Math.round(mo*0.20);
@@ -1039,13 +1192,13 @@ function renderMvt(){
   const filtre=g('mvt-filtre')?.value||'all';
   let mvts=[];
   if(filtre==='all'||filtre==='ventes'){
-    mvts.push(...DB.ventes.map(v=>({id:v.id,date:v.date_facture,lib:v.numero||'Facture',detail:v.categorie,montant:v.montant_ht,pos:true,paye:v.paye,type:'vente',table:'wec_ventes',cid:v.code_chantier||v.cid})));
+    mvts.push(...DB.ventes.map(v=>({id:v.id,date:v.date_facture,lib:v.numero||'Facture',detail:v.categorie,montant:v.montant_ht,pos:true,paye:v.paye,type:'vente',table:'wec_ventes',cid:v.code_chantier})));
   }
   if(filtre==='all'||filtre==='gars'){
-    mvts.push(...DB.depenses.filter(d=>d.categorie==='gars'||d.categorie==='facture_gars').map(d=>({id:d.id,date:d.date_achat,lib:d.fournisseur||'GARS',detail:d.categorie,montant:d.montant_ht,pos:false,paye:d.paye,type:'gars',table:'wec_depenses',cid:d.code_chantier||d.cid})));
+    mvts.push(...DB.depenses.filter(d=>d.categorie==='gars'||d.categorie==='facture_gars').map(d=>({id:d.id,date:d.date_achat,lib:d.fournisseur||'GARS',detail:d.categorie,montant:d.montant_ht,pos:false,paye:d.paye,type:'gars',table:'wec_depenses',cid:d.code_chantier})));
   }
   if(filtre==='all'||filtre==='walid'){
-    mvts.push(...DB.walid_net.map(w=>({id:w.id,date:w.date_virement,lib:'Walid — '+(w.categorie==='famille'?'Famille':w.categorie==='urssaf'?'URSSAF':'Perso'),detail:w.categorie,montant:w.montant,pos:false,paye:true,type:'walid',table:'wec_walid_net',cid:w.code_chantier||w.cid})));
+    mvts.push(...DB.walid_net.map(w=>({id:w.id,date:w.date_virement,lib:'Walid — '+(w.categorie==='famille'?'Famille':w.categorie==='urssaf'?'URSSAF':'Perso'),detail:w.categorie,montant:w.montant,pos:false,paye:true,type:'walid',table:'wec_walid_net',cid:w.code_chantier})));
   }
   if(filtre==='all'||filtre==='charge_fixe'){
     mvts.push(...DB.depenses.filter(d=>d.categorie==='charge_fixe').map(d=>({id:d.id,date:d.date_achat,lib:d.fournisseur||'Charge fixe',detail:'charge_fixe',montant:d.montant_ht,pos:false,paye:d.paye,type:'charge',table:'wec_depenses',cid:null})));
@@ -1105,7 +1258,7 @@ function renderWC(){
   const actifs=DB.chantiers.filter(c=>c.statut==='en_cours');
   if(!actifs.length){g('walid-chant').innerHTML='<div class="empty">Aucun chantier en cours</div>';return;}
   g('walid-chant').innerHTML=actifs.map(c=>{
-    const ventes=DB.ventes.filter(v=>(v.code_chantier===c.id||v.code_chantier===c.code||v.cid===c.id||v.cid===c.code));
+    const ventes=DB.ventes.filter(v=>matchCh(v,c));
     const encaisse=ventes.filter(v=>v.paye).reduce((s,v)=>s+(v.ventil_net||0)+(v.ventil_famille||0),0);
     const attente=ventes.filter(v=>!v.paye).reduce((s,v)=>s+(v.ventil_net||0)+(v.ventil_famille||0),0);
     return`<div class="wc-card" onclick="ouvrirWD('${c.id}')" style="cursor:pointer">
@@ -1124,8 +1277,8 @@ function renderWC(){
 // ─── WALID — DÉTAIL CHANTIER ───
 function ouvrirWD(cid){
   const c=DB.chantiers.find(x=>x.id===cid);if(!c)return;
-  const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);
-  const ventes=DB.ventes.filter(v=>(v.code_chantier===c.id||v.code_chantier===c.code||v.cid===c.id||v.cid===c.code));
+  const bud=DB.budgets.find(b=>matchCh(b,c));
+  const ventes=DB.ventes.filter(v=>matchCh(v,c));
   const fam=bud?.famille_total||0;
   const np=bud?.net_perso_total||0;
   const netT=fam+np;
@@ -1168,12 +1321,44 @@ function ouvrirWD(cid){
   } else {
     factsHtml=`<div style="padding:0 16px 16px"><div class="empty" style="padding:20px">Aucune facture enregistrée</div></div>`;
   }
+  // Barres progression enveloppes (famille + net perso réalisés vs prévus)
+  let barsHtml='';
+  if(bud){
+    const famEnc=ventes.filter(v=>v.paye).reduce((s,v)=>s+(v.ventil_famille||0),0);
+    const famAtt=ventes.filter(v=>!v.paye).reduce((s,v)=>s+(v.ventil_famille||0),0);
+    const netEnc=ventes.filter(v=>v.paye).reduce((s,v)=>s+(v.ventil_net||0),0);
+    const netAtt=ventes.filter(v=>!v.paye).reduce((s,v)=>s+(v.ventil_net||0),0);
+    const bar=(label,enc,att,budget,col)=>{
+      if(budget<=0)return '';
+      const pEnc=Math.min(100,budget>0?enc/budget*100:0);
+      const pAtt=Math.min(100-pEnc,budget>0?att/budget*100:0);
+      return`<div style="margin-bottom:14px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">
+          <span style="font-weight:700">${label}</span>
+          <span style="color:var(--t2)">${f(enc)} / ${f(budget)}</span>
+        </div>
+        <div style="background:var(--gy);border-radius:6px;height:10px;overflow:hidden;display:flex">
+          <div style="width:${pEnc}%;background:${col}"></div>
+          <div style="width:${pAtt}%;background:${col};opacity:.4"></div>
+        </div>
+        ${att>0?`<div style="font-size:10px;color:var(--t2);margin-top:3px">${f(att)} en attente de règlement</div>`:''}
+      </div>`;
+    };
+    barsHtml=`<div class="wd-sec">
+      <div class="wd-sec-title">Où j'en suis vs ce qui est prévu</div>
+      <div class="wd-synth">
+        ${fam>0?bar('👨‍👩‍👧 Famille',famEnc,famAtt,fam,'#60a5fa'):''}
+        ${bar('💰 Net perso',netEnc,netAtt,np,'var(--gn)')}
+      </div>
+    </div>`;
+  }
   let html=`
-    <div class="wd-header"><div class="wd-titre">${c.nom}</div><div class="wd-sous">Marché : ${f(c.marche_ht||0)}</div></div>
+    <div class="wd-header"><div class="wd-titre">${c.nom}</div><div class="wd-sous">${c.code?c.code+' · ':''}Marché : ${f(c.marche_ht||0)}</div></div>
     ${regleGars>0?`<div class="wd-regle" style="margin:12px 16px">
       <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:4px">⚠ La règle des gars</div>
       <div style="font-size:13px;color:var(--am)">Budget max : <b>${f(regleGars)}</b><br>Si on dépasse, ton net diminue</div>
     </div>`:''}
+    ${barsHtml}
     ${factsHtml}
     ${netT>0?`<div class="wd-objectif" style="margin:0 16px 12px">
       <div class="wdo-title">Ton objectif sur ce chantier</div>
@@ -1197,7 +1382,7 @@ function toggleFact(id){
 // ─── WALID — VALIDATION ───
 function waliderDevis(cid){
   const c=DB.chantiers.find(x=>x.id===cid);if(!c)return;
-  const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);if(!bud)return;
+  const bud=DB.budgets.find(b=>matchCh(b,c));if(!bud)return;
   confirmDialog('Tu confirmes avoir lu et accepté ce plan financier ?',async()=>{
     const today=new Date().toISOString().slice(0,10);
     const ok=await sbPatch('wec_budgets',bud.id,{walid_ok:true,date_walid_ok:today});
@@ -1216,7 +1401,7 @@ function renderWR(){
   const hist=DB.walid_net.filter(w=>w.categorie==='famille'||w.categorie==='walid_net').slice(0,30);
   if(!hist.length){g('recap-hist').innerHTML='<div class="empty">Aucun virement enregistré</div>';return;}
   g('recap-hist').innerHTML=hist.map(w=>{
-    const c=DB.chantiers.find(x=>x.id===(w.code_chantier||w.cid)||x.code===(w.code_chantier||w.cid));
+    const c=DB.chantiers.find(x=>x.code===w.code_chantier||x.id===w.code_chantier);
     return`<div class="recap-line">
       <div class="rl-left">
         <div class="rl-date">${fDate(w.date_virement)}</div>
