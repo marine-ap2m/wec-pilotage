@@ -348,22 +348,117 @@ async function sbGet(t,q=''){const r=await fetch(`${SB}/rest/v1/${t}?${q}`,{head
 async function sbPost(t,d){const r=await fetch(`${SB}/rest/v1/${t}`,{method:'POST',headers:{...H,'Content-Type':'application/json','Prefer':'return=representation'},body:JSON.stringify(d)});if(!r.ok){showToast('Erreur d\'enregistrement','err');return null;}return r.json();}
 async function sbPatch(t,id,d){const r=await fetch(`${SB}/rest/v1/${t}?id=eq.${id}`,{method:'PATCH',headers:{...H,'Content-Type':'application/json','Prefer':'return=minimal'},body:JSON.stringify(d)});if(!r.ok){showToast('Erreur de mise à jour','err');return false;}return true;}
 
-// ─── FORMULES VERROUILLÉES ───
+// ─── FORMULES VERROUILLÉES (v2 — gelées) ───
+// FRAIS_MENSUELS = Qonto(12) + Dougs(119) + Assurance(497) + AP2M(1200) = 1828€/mois
+// URSSAF_RATE = 0.23 (gelé v2 — point)
+const FRAIS_MENSUELS=1828;
+const URSSAF_RATE=0.23;
 const MATH={
-  provisionCF:(dur,nb)=>1828*dur/nb,
+  // Provision charges fixes (en mois OU en jours selon arg)
+  provisionCF:(dur,nb)=>FRAIS_MENSUELS*dur/Math.max(1,nb||1),
+  provisionJours:(dureeJours,nbActifs)=>FRAIS_MENSUELS*(dureeJours||0)/(30*Math.max(1,nbActifs||1)),
   baseNette:(m,av,pcf)=>(m+av)-(pcf||0),
+  // Enveloppes par défaut 45/55 (Marine peut redistribuer ensuite)
+  envGarsDefault:(b)=>b*0.45,
+  envWalDefault:(b)=>b*0.55,
   envGars:(b)=>b*0.45,
   moOuvriers:(eg)=>eg/1.20,
   factGars:(mo)=>mo*0.20,
   factWal:(b,eg)=>b-eg,
-  urssaf:(fw)=>fw*0.212,
-  netTotal:(fw)=>fw*0.75,
-  netPerso:(nt,fam,reg)=>nt-fam-(reg||0),
+  // URSSAF auto = ventil_wal × 0.23 (jamais éditable)
+  urssaf:(fw)=>fw*URSSAF_RATE,
+  ventilUrssaf:(vWal)=>(vWal||0)*URSSAF_RATE,
+  // Net Walid = wal - urssaf - treso - regul
+  ventilNet:(vWal,vTreso,vRegul)=>(vWal||0)-(vWal||0)*URSSAF_RATE-(vTreso||0)-(vRegul||0),
+  netTotal:(fw)=>fw*(1-URSSAF_RATE),
+  netPerso:(nt,fam,reg)=>nt-(fam||0)-(reg||0),
+  // Équilibre strict : env_gars + env_wal + env_regul_urssaf + env_famille = baseNette
+  sumEnvelopes:(eg,ew,er,ef)=>(eg||0)+(ew||0)+(er||0)+(ef||0),
+  isBalanced:(base,eg,ew,er,ef)=>Math.abs((base||0)-MATH.sumEnvelopes(eg,ew,er,ef))<1,
 };
+
+// ─── CASCADE ENGINE (v2) ──────────────────────────────────────
+// Calcule l'état des enveloppes restantes par projet, à partir des ventes
+// dont le statut est validee/payee/cloturee (les brouillons ne consomment pas).
+// Joins sur code_chantier (PK v2). Aucune mutation, lecture seule.
+function ventesValidees(c){
+  return DB.ventes.filter(v=>{
+    const ok=(v.code_chantier===c.code||v.code_chantier===c.id||v.cid===c.code||v.cid===c.id);
+    if(!ok)return false;
+    const st=v.statut||(v.paye?'payee':'validee');
+    return st==='validee'||st==='payee'||st==='cloturee';
+  });
+}
+function envelopeRestant(codeChantier){
+  const c=DB.chantiers.find(x=>x.code===codeChantier||x.id===codeChantier);
+  if(!c)return null;
+  const ventes=ventesValidees(c);
+  const usedGars =ventes.reduce((s,v)=>s+(v.ventil_gars||0)+(v.ventil_fact_gars||0),0);
+  const usedWal  =ventes.reduce((s,v)=>s+(v.ventil_wal||0),0);
+  const usedFam  =ventes.reduce((s,v)=>s+(v.ventil_famille||0),0);
+  const usedRegul=ventes.reduce((s,v)=>s+(v.ventil_regul_urssaf||0),0);
+  // Override accumulé : Marine a forcé X€ → réduit le net Walid de la facture
+  // courante uniquement (pas l'enveloppe future). Ce qu'on suit ici est ce qui
+  // a été réellement consommé sur env_wal côté ventil_wal.
+  return {
+    env_gars_total:c.env_gars||0,           env_gars_used:usedGars,
+    env_gars_restant:(c.env_gars||0)-usedGars,
+    env_wal_total:c.env_wal||0,             env_wal_used:usedWal,
+    env_wal_restant:(c.env_wal||0)-usedWal,
+    env_famille_total:c.env_famille||0,     env_famille_used:usedFam,
+    env_famille_restant:(c.env_famille||0)-usedFam,
+    env_regul_urssaf_total:c.env_regul_urssaf||0,  env_regul_urssaf_used:usedRegul,
+    env_regul_urssaf_restant:(c.env_regul_urssaf||0)-usedRegul,
+  };
+}
+// Suggestions équirépartition pour les factures brouillon
+function suggestionsBrouillons(codeChantier){
+  const c=DB.chantiers.find(x=>x.code===codeChantier||x.id===codeChantier);
+  if(!c)return[];
+  const r=envelopeRestant(codeChantier);if(!r)return[];
+  const brouillons=DB.ventes.filter(v=>(v.code_chantier===c.code||v.code_chantier===c.id)&&(v.statut==='brouillon'));
+  const n=Math.max(1,brouillons.length);
+  return brouillons.map(b=>({
+    id:b.id,
+    sugg_gars:Math.max(0,Math.round(r.env_gars_restant/n)),
+    sugg_wal:Math.max(0,Math.round(r.env_wal_restant/n)),
+    sugg_famille:Math.max(0,Math.round(r.env_famille_restant/n)),
+    sugg_regul_urssaf:Math.max(0,Math.round(r.env_regul_urssaf_restant/n)),
+  }));
+}
+// Vérifie qu'une ventilation tient dans l'enveloppe restante (hors facture en cours d'édition)
+function checkOverflow(codeChantier,proposed,excludeFactureId){
+  const c=DB.chantiers.find(x=>x.code===codeChantier||x.id===codeChantier);
+  if(!c)return{overflow:false};
+  const ventes=ventesValidees(c).filter(v=>v.id!==excludeFactureId);
+  const usedWal=ventes.reduce((s,v)=>s+(v.ventil_wal||0),0);
+  const restant=(c.env_wal||0)-usedWal;
+  const proposedWal=proposed.ventil_wal||0;
+  if(proposedWal>restant){
+    return{overflow:true,amount:proposedWal-restant,restant,proposedWal,
+      message:`Dépassement env. WAL de ${Math.round(proposedWal-restant)}€. Forcer y compense sur le net Walid.`};
+  }
+  return{overflow:false,restant};
+}
+
+// ─── AUDIT LOG (append-only, silencieux si table absente) ────
+async function logAudit(action,codeChantier,factureId,details){
+  try{
+    await fetch(`${SB}/rest/v1/wec_audit_logs`,{
+      method:'POST',
+      headers:{...H,'Content-Type':'application/json','Prefer':'return=minimal'},
+      body:JSON.stringify({
+        id:uid(),action,user_role:PROFIL||'unknown',
+        code_chantier:codeChantier||null,facture_id:factureId||null,
+        details:details||null
+      })
+    });
+  }catch(e){/* silencieux : audit ne doit pas bloquer l'UX */}
+}
 
 // ─── ÉTAT ───
 let PROFIL='';
-let DB={chantiers:[],budgets:[],factures:[],ventes:[],depenses:[],walid_net:[],urssaf:[]};
+let DB={chantiers:[],budgets:[],factures:[],ventes:[],depenses:[],walid_net:[],urssaf:[],audit:[]};
 let PIN='';
 let _confirmCb=null;
 
@@ -518,7 +613,7 @@ function calcSim(){
       <div class="row"><span>Main d'oeuvre terrain</span><b style="color:var(--or)">${f(mo)}</b></div>
       <div class="row"><span>Facture main d'oeuvre (20%)</span><b>${f(fg)}</b></div>
       <div class="row"><span>WAL Conseils total</span><b>${f(fw)}</b></div>
-      <div class="row"><span>URSSAF WAL (21,2%)</span><b style="color:var(--rd)">${f(urs)}</b></div>
+      <div class="row"><span>URSSAF WAL (23%)</span><b style="color:var(--rd)">${f(urs)}</b></div>
       ${regul>0?`<div class="row"><span>Régul URSSAF</span><b style="color:var(--rd)">-${f(regul)}</b></div>`:''}
       ${fam>0?`<div class="row"><span>Famille</span><b>${f(fam)}</b></div>`:''}
       <div class="row total"><span>Net Walid perso</span><b>${f(np)}</b></div>
@@ -537,8 +632,8 @@ function calcSim(){
     facts.push({num:i,m:Math.round(reste/nbAutres),w,mo:Math.round(mo*ri),fg:Math.round(fg*ri),fam:Math.round(fam*ri),reg:0});
   }
   g('sim-facts').innerHTML=facts.map(fx=>{
-    const u=Math.round(fx.w*0.212);
-    const n=Math.max(0,Math.round(fx.w*0.75-fx.fam-fx.reg));
+    const u=Math.round(MATH.ventilUrssaf(fx.w));
+    const n=Math.max(0,Math.round(fx.w-u-fx.fam-fx.reg));
     const isReg=fx.reg>0&&n===0;
     return`<div class="sim-fact" style="${isReg?'border-color:var(--rd)':''}">
       <div class="sf-head"><span style="font-size:13px;font-weight:800">Facture ${fx.num}</span><span style="font-size:12px;color:var(--or);font-weight:700">${f(fx.m)}</span></div>
@@ -572,16 +667,26 @@ async function validerSim(){
   setBtnLoading('btn-valider',true);
   const cid=uid();
   const bid=uid();
-  const c={id:cid,code,nom,statut:'en_cours',marche_ht:_SIM.marche,avenant_ht:_SIM.av,env_gars:_SIM.eg};
+  // v2 : enveloppes éditables stockées sur wec_chantiers (45/55 par défaut, regul/famille = ajustés)
+  const envWal=_SIM.fw;
+  const envRegul=_SIM.regul||0;
+  const envFam=_SIM.fam||0;
+  // Si Marine a saisi famille / regul, on les soustrait à env_wal pour rester en équilibre
+  const envWalNet=envWal-envRegul-envFam;
+  const c={id:cid,code,nom,statut:'en_cours',marche_ht:_SIM.marche,avenant_ht:_SIM.av,
+    env_gars:_SIM.eg,env_wal:envWalNet,env_regul_urssaf:envRegul,env_famille:envFam,
+    base_nette:_SIM.base,provision_charges:_SIM.provCF,
+    duree_jours:_SIM.nbf*30,nb_projets_actifs:_SIM.nbc};
   const r=await sbPost('wec_chantiers',c);
   if(!r){setBtnLoading('btn-valider',false);return;}
   const bud={id:bid,code_chantier:code,duree_mois:_SIM.nbf,nb_chantiers_actifs:_SIM.nbc,base_ht:_SIM.base,env_gars_total:_SIM.eg,mo_total:_SIM.mo,fact_gars_total:_SIM.fg,wal_total:_SIM.fw,urssaf_total:_SIM.urs,famille_total:_SIM.fam,net_perso_total:_SIM.np,urssaf_regul:_SIM.regul,valide:true,date_validation:new Date().toISOString().slice(0,10)};
   await sbPost('wec_budgets',bud);
   await Promise.all(_SIM.facts.map(fx=>{
-    const u=Math.round(fx.w*0.212);
-    const n=Math.max(0,Math.round(fx.w*0.75-fx.fam-fx.reg));
+    const u=Math.round(MATH.ventilUrssaf(fx.w));
+    const n=Math.max(0,Math.round(fx.w-u-fx.fam-fx.reg));
     return sbPost('wec_budgets_factures',{id:uid(),budget_id:bid,code_chantier:code,num_facture:fx.num,montant_marche:fx.m,montant_wal:fx.w,mo:fx.mo,urssaf:u,famille:fx.fam,net_perso:n});
   }));
+  logAudit('chantier_created',code,null,{nom,marche:_SIM.marche,base_nette:_SIM.base,env_gars:_SIM.eg,env_wal:envWalNet,env_famille:envFam,env_regul_urssaf:envRegul});
   DB.chantiers.unshift(c);DB.budgets.push(bud);
   ['s-nom','s-code','s-marche','s-avenant','s-mo','s-fam'].forEach(x=>g(x).value='');
   g('s-avenant').value='0';g('s-regul').value='0';
@@ -626,21 +731,42 @@ function ouvrirFiche(cid){
   g('fiche-nom').textContent=c.nom;
   const statDict2={'en_cours':'En cours','a_venir':'À venir','termine':'Terminé'};
   g('fiche-meta').innerHTML=(c.code||'')+' · Marché : '+f(c.marche_ht||0)+' · <select onchange="changerStatut(\''+c.id+'\',this.value)" style="background:var(--gy);border:1px solid var(--bd);border-radius:6px;color:var(--wh);font-size:11px;padding:2px 6px"><option value="en_cours" '+(c.statut==='en_cours'?'selected':'')+'>En cours</option><option value="a_venir" '+(c.statut==='a_venir'?'selected':'')+'>À venir</option><option value="termine" '+(c.statut==='termine'?'selected':'')+'>Terminé</option></select>';
+  // ─── v2 : Carte enveloppes éditables + restant cascade ───
+  const rest=envelopeRestant(c.code||c.id);
+  const envCard=`<div class="card" style="border:1px solid var(--or)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div class="card-title" style="margin:0">Enveloppes — restant</div>
+      <button class="btn btn-or btn-sm" onclick="editEnveloppes('${c.id}')" style="width:auto">✏️ Éditer</button>
+    </div>
+    ${rest?[
+      ['Garçons (MO+Fact 20%)',rest.env_gars_total,rest.env_gars_used,rest.env_gars_restant],
+      ['WAL Conseils',rest.env_wal_total,rest.env_wal_used,rest.env_wal_restant],
+      ['Régul URSSAF',rest.env_regul_urssaf_total,rest.env_regul_urssaf_used,rest.env_regul_urssaf_restant],
+      ['Famille',rest.env_famille_total,rest.env_famille_used,rest.env_famille_restant],
+    ].map(([lab,tot,used,r])=>{
+      const col=r<0?'var(--rd)':(tot>0&&used/tot>0.8?'var(--am)':'var(--gn)');
+      const ic=r<0?'🔴':(tot>0&&used/tot>0.8?'🟡':'🟢');
+      return`<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--bd);font-size:12px">
+        <span>${ic} ${lab}</span>
+        <span style="font-size:11px;color:var(--t2)">budget ${f(tot)} · utilisé ${f(used)}</span>
+        <b style="color:${col};min-width:80px;text-align:right">${r>=0?'+':''}${f(r)}</b></div>`;
+    }).join(''):'<div class="empty" style="padding:12px">Pas d\'enveloppes définies</div>'}
+  </div>`;
   // Budget validé
   if(!bud){
-    g('fiche-budget').innerHTML='<div class="empty">Aucun budget validé.<br>Créez-le via le Simulateur.</div>';
+    g('fiche-budget').innerHTML=envCard+'<div class="empty">Aucun budget validé.<br>Créez-le via le Simulateur.</div>';
   } else {
     const provCF=bud.provision_charges||(1828*(bud.duree_mois||facts.length||3)/(bud.nb_chantiers_actifs||1));
-    g('fiche-budget').innerHTML=`
+    g('fiche-budget').innerHTML=envCard+`
       <div class="card">
-        <div class="card-title">Enveloppes globales validées</div>
+        <div class="card-title">Enveloppes globales validées (snapshot simulateur)</div>
         <div class="row"><span>Marché + avenant</span><b>${f((c.marche_ht||0)+(c.avenant_ht||0))}</b></div>
         <div class="row"><span style="color:var(--t2)">Tréso WEC (charges fixes)</span><b style="color:var(--t2)">-${f(provCF)}</b></div>
         <div class="row"><span>Base nette</span><b>${f(bud.base_ht||0)}</b></div>
         <div class="row"><span>MO terrain</span><b style="color:var(--or)">${f(bud.mo_total||0)}</b></div>
         <div class="row"><span>Facture GARS (20%)</span><b style="color:var(--or)">${f(bud.fact_gars_total||0)}</b></div>
         <div class="row"><span>WAL Conseils total</span><b>${f(bud.wal_total||0)}</b></div>
-        <div class="row"><span>URSSAF WAL (21,2%)</span><b style="color:var(--rd)">${f(bud.urssaf_total||0)}</b></div>
+        <div class="row"><span>URSSAF WAL (23%)</span><b style="color:var(--rd)">${f(bud.urssaf_total||0)}</b></div>
         ${(bud.urssaf_regul||0)>0?`<div class="row"><span>Régul URSSAF absorbée</span><b style="color:var(--rd)">-${f(bud.urssaf_regul)}</b></div>`:''}
         ${(bud.famille_total||0)>0?`<div class="row"><span>Famille</span><b style="color:#60a5fa">${f(bud.famille_total)}</b></div>`:''}
         <div class="row total"><span>Net Walid perso</span><b>${f(bud.net_perso_total||0)}</b></div>
@@ -703,6 +829,23 @@ function ouvrirFiche(cid){
     </div>`;
   };
   const alerteGlobale=resteGars<0||resteFam<0||resteWal<0||resteNet<0;
+  // v2 : liste des factures du chantier avec bouton Éditer (Marine)
+  const factCard=`<div class="card">
+    <div class="card-title">Factures du chantier (${ventes.length})</div>
+    ${ventes.length?ventes.sort((a,b)=>(b.date_facture||'')>(a.date_facture||'')?1:-1).map(v=>{
+      const st=v.statut||(v.paye?'payee':'validee');
+      const stCol={brouillon:'var(--t2)',validee:'var(--am)',payee:'var(--gn)',cloturee:'var(--t3)'}[st]||'var(--t2)';
+      const stTxt={brouillon:'Brouillon',validee:'Validée',payee:'Payée ✓',cloturee:'Clôturée'}[st]||st;
+      const overflow=(v.force_overflow||0)>0;
+      return`<div style="background:var(--gy);border-radius:8px;padding:10px;margin-bottom:6px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div><b>${v.numero||'—'}</b> · ${f(v.montant_ht||0)} <span style="color:${stCol};font-size:11px;margin-left:6px">${stTxt}</span>${overflow?` <span style="color:var(--rd);font-size:10px;font-weight:700">⚠ forcé +${f(v.force_overflow)}</span>`:''}</div>
+          <button class="btn btn-nv btn-sm" onclick="editVente('${v.id}')" style="width:auto;margin:0">✏️ Éditer</button>
+        </div>
+        <div style="font-size:10px;color:var(--t2)">Gars ${f(v.ventil_gars||0)} · Fact ${f(v.ventil_fact_gars||0)} · Tréso ${f(v.ventil_treso||0)} · WAL ${f(v.ventil_wal||0)} · URSSAF ${f(v.ventil_urssaf||0)} · Net ${f(v.ventil_net||0)}</div>
+      </div>`;
+    }).join(''):'<div class="empty" style="padding:14px">Aucune facture sur ce chantier</div>'}
+  </div>`;
   g('fiche-reel').innerHTML=`
     ${alerteGlobale?`<div class="alerte-box" style="margin-bottom:12px">⚠️ Une ou plusieurs enveloppes sont dépassées sur ce chantier. Ne pas compenser sur d'autres chantiers — voir le détail ci-dessous.</div>`:''}
     <div class="card">
@@ -710,6 +853,7 @@ function ouvrirFiche(cid){
       <div class="row"><span>Factures encaissées</span><b style="color:var(--gn)">${f(caEnc)}</b></div>
       <div class="row"><span>En attente</span><b style="color:var(--am)">${f(ventes.reduce((s,v)=>s+v.montant_ht,0)-caEnc)}</b></div>
     </div>
+    ${factCard}
     <div class="card">
       <div class="card-title">Suivi enveloppes — Budget vs Réel</div>
       ${bud?[
@@ -760,7 +904,7 @@ function openModal(type){
       <div class="form-group"><label>Famille (€)</label><input type="number" id="v-fam" placeholder="0" oninput="ventilCalc()"></div>
       <div id="v-recap" class="vp hidden">
         <div class="vp-row"><span>WAL Conseils</span><span id="v-wal-val">—</span></div>
-        <div class="vp-row"><span>URSSAF (21,2%)</span><span id="v-urs-val">—</span></div>
+        <div class="vp-row"><span>URSSAF (23%)</span><span id="v-urs-val">—</span></div>
         <div class="vp-row"><span>Net Walid perso</span><span id="v-net-val">—</span></div>
         <div class="vp-row" id="v-ecart-row"><span>Écart</span><span id="v-ecart-val">—</span></div>
       </div>
@@ -783,7 +927,7 @@ function openModal(type){
       <div class="form-group"><label>Montant brut WAL facturé (€)</label><input type="number" id="m-brut" placeholder="0" oninput="previewWal()"></div>
       <div id="prev-wal" class="vp hidden">
         <div class="vp-row"><span>Brut WAL facturé</span><span id="pw-brut">—</span></div>
-        <div class="vp-row"><span>URSSAF 21,2%</span><span id="pw-urs">—</span></div>
+        <div class="vp-row"><span>URSSAF 23%</span><span id="pw-urs">—</span></div>
         <div class="vp-row"><span>Net Walid</span><span id="pw-net">—</span></div>
       </div>
       <div class="form-group"><label>Date</label><input type="date" id="m-date" value="${today}"></div>
@@ -829,8 +973,8 @@ function ventilCalc(){
   const treso=parseFloat(g('v-treso')?.value)||0;
   const fam=parseFloat(g('v-fam')?.value)||0;
   const wal=Math.max(0,amt-gars-fg-treso);
-  const urs=Math.round(wal*0.212);
-  const net=Math.max(0,Math.round(wal*0.75-fam));
+  const urs=Math.round(MATH.ventilUrssaf(wal));
+  const net=Math.max(0,Math.round(wal-urs-fam));
   const ecart=amt-(gars+fg+treso+wal);
   if(gars>0){
     g('v-fg-val').textContent=f(fg);
@@ -863,7 +1007,8 @@ function previewGars(){
 function previewWal(){
   const brut=parseFloat(g('m-brut').value)||0;
   if(!brut){g('prev-wal').classList.add('hidden');return;}
-  const urs=Math.round(brut*0.212);const net=Math.round(brut*0.75);
+  const urs=Math.round(MATH.ventilUrssaf(brut));
+  const net=Math.round(brut-urs);
   g('pw-brut').textContent=f(brut);g('pw-urs').textContent=f(urs);g('pw-net').textContent=f(net);
   g('prev-wal').classList.remove('hidden');
 }
@@ -882,11 +1027,12 @@ async function save(type){
     const treso=parseFloat(g('v-treso')?.value)||0;
     const fam=parseFloat(g('v-fam')?.value)||0;
     const wal=Math.max(0,amt-gars-fg-treso);
-    const urs=Math.round(wal*0.212);
-    const net=Math.max(0,Math.round(wal*0.75-fam));
+    const urs=Math.round(MATH.ventilUrssaf(wal));
+    const net=Math.max(0,Math.round(wal-urs-fam));
     const row={id:uid(),code_chantier:cid,date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,categorie:'facture_vente',
-      ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
-    const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);closeModal();renderBord();if(PROFIL==='marine')renderMvt();showToast('Facture enregistrée');}
+      statut:paye?'payee':'validee',
+      ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_regul_urssaf:0,ventil_net:net};
+    const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);logAudit('facture_created',cid,row.id,{numero:num,montant_brut:amt,ventil_wal:wal,ventil_net:net});closeModal();renderBord();if(PROFIL==='marine')renderMvt();showToast('Facture enregistrée');}
   } else if(type==='gars'){
     const mo=parseFloat(g('m-mo').value)||0;if(!mo){showToast('Montant requis','err');return;}
     const four=g('m-four').value||'GARS';const fg=Math.round(mo*0.20);
@@ -935,12 +1081,191 @@ async function saveModifChantier(cid){
   const avenant=parseFloat(g('mc-avenant').value)||0;
   const statut=g('mc-statut').value;
   if(!nom){showToast('Nom requis','err');return;}
+  const before=DB.chantiers.find(x=>x.id===cid);
   const ok=await sbPatch('wec_chantiers',cid,{nom,code,marche_ht:marche,avenant_ht:avenant,statut});
   if(ok){
     const c=DB.chantiers.find(x=>x.id===cid);
     if(c){c.nom=nom;c.code=code;c.marche_ht=marche;c.avenant_ht=avenant;c.statut=statut;}
+    logAudit('chantier_edited',code||cid,null,{
+      before:{nom:before?.nom,marche:before?.marche_ht,avenant:before?.avenant_ht,statut:before?.statut},
+      after:{nom,marche,avenant,statut}});
     closeModal();renderChantiers();showToast('Chantier modifié');
   }
+}
+
+// ─── ENVELOPPES ÉDITABLES (Marine, équilibre strict) ──────────
+let _EE_BASE=0;
+function editEnveloppes(cid){
+  const c=DB.chantiers.find(x=>x.id===cid);if(!c)return;
+  // Si pas de base_nette stockée, on la dérive du budget existant
+  const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);
+  const prov=c.provision_charges||bud?.provision_charges||0;
+  const base=c.base_nette||bud?.base_ht||((c.marche_ht||0)+(c.avenant_ht||0)-prov);
+  _EE_BASE=base;
+  const eg=c.env_gars||0, ew=c.env_wal||bud?.wal_total||0, er=c.env_regul_urssaf||bud?.urssaf_regul||0, ef=c.env_famille||bud?.famille_total||0;
+  g('m-titre').textContent='Enveloppes — '+c.nom;
+  g('m-body').innerHTML=`
+    <div style="font-size:11px;color:var(--t2);margin-bottom:10px">
+      Marché : <b>${f((c.marche_ht||0)+(c.avenant_ht||0))}</b> · Provision : <b>${f(prov)}</b>
+    </div>
+    <div style="background:var(--gy);border-radius:8px;padding:10px;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;font-size:13px"><span>Base nette à répartir</span><b style="color:var(--or)">${f(base)}</b></div>
+    </div>
+    <div class="form-group"><label>Env. Garçons (MO + Facture 20%)</label>
+      <input type="number" id="ee-gars" value="${Math.round(eg)}" oninput="checkEquilibre()"></div>
+    <div class="form-group"><label>Env. WAL Conseils (brut)</label>
+      <input type="number" id="ee-wal" value="${Math.round(ew)}" oninput="checkEquilibre()"></div>
+    <div class="form-group"><label>Env. Régul URSSAF</label>
+      <input type="number" id="ee-regul" value="${Math.round(er)}" oninput="checkEquilibre()"></div>
+    <div class="form-group"><label>Env. Famille</label>
+      <input type="number" id="ee-fam" value="${Math.round(ef)}" oninput="checkEquilibre()"></div>
+    <div id="ee-eq" style="background:var(--gy);border-radius:8px;padding:10px;margin-bottom:12px;font-size:12px"></div>
+    <button class="btn btn-or" id="ee-save" onclick="saveEnveloppes('${cid}')">💾 Enregistrer les enveloppes</button>`;
+  g('modal').classList.add('open');
+  checkEquilibre();
+}
+function checkEquilibre(){
+  const eg=parseFloat(g('ee-gars').value)||0;
+  const ew=parseFloat(g('ee-wal').value)||0;
+  const er=parseFloat(g('ee-regul').value)||0;
+  const ef=parseFloat(g('ee-fam').value)||0;
+  const sum=eg+ew+er+ef;
+  const ecart=_EE_BASE-sum;
+  const ok=Math.abs(ecart)<1;
+  g('ee-eq').innerHTML=`<div style="display:flex;justify-content:space-between"><span>Somme enveloppes</span><b>${f(sum)}</b></div>
+    <div style="display:flex;justify-content:space-between;color:${ok?'var(--gn)':'var(--rd)'};font-weight:700;margin-top:4px">
+      <span>${ok?'🟢 Équilibre OK':'🔴 Écart à équilibrer'}</span><b>${ecart>0?'+':''}${f(ecart)}</b></div>`;
+  g('ee-save').disabled=!ok;
+  g('ee-save').style.opacity=ok?'1':'.4';
+}
+async function saveEnveloppes(cid){
+  const eg=parseFloat(g('ee-gars').value)||0;
+  const ew=parseFloat(g('ee-wal').value)||0;
+  const er=parseFloat(g('ee-regul').value)||0;
+  const ef=parseFloat(g('ee-fam').value)||0;
+  if(!MATH.isBalanced(_EE_BASE,eg,ew,er,ef)){showToast('Enveloppes non équilibrées','err');return;}
+  const c=DB.chantiers.find(x=>x.id===cid);if(!c)return;
+  const before={env_gars:c.env_gars,env_wal:c.env_wal,env_regul_urssaf:c.env_regul_urssaf,env_famille:c.env_famille};
+  const ok=await sbPatch('wec_chantiers',cid,{env_gars:eg,env_wal:ew,env_regul_urssaf:er,env_famille:ef,base_nette:_EE_BASE});
+  if(!ok)return;
+  c.env_gars=eg;c.env_wal=ew;c.env_regul_urssaf=er;c.env_famille=ef;c.base_nette=_EE_BASE;
+  logAudit('enveloppes_edited',c.code||c.id,null,{before,after:{env_gars:eg,env_wal:ew,env_regul_urssaf:er,env_famille:ef}});
+  closeModal();ouvrirFiche(cid);showToast('Enveloppes mises à jour');
+}
+
+// ─── ÉDITION FACTURE (Marine) ─────────────────────────────────
+let _EV_ID=null, _EV_CODE=null;
+function editVente(vid){
+  const v=DB.ventes.find(x=>x.id===vid);if(!v){showToast('Facture introuvable','err');return;}
+  const code=v.code_chantier||v.cid;
+  const c=DB.chantiers.find(x=>x.code===code||x.id===code);
+  const st=v.statut||(v.paye?'payee':'validee');
+  // Verrou : payee/cloturee = lecture seule (Marine peut quand même rééditer si elle le veut, mais on warn)
+  _EV_ID=vid; _EV_CODE=code;
+  g('m-titre').textContent='Éditer '+(v.numero||'facture');
+  const lock=(st==='payee'||st==='cloturee')?'<div style="background:#3d2200;border:1px solid var(--am);border-radius:8px;padding:8px;margin-bottom:10px;font-size:11px;color:var(--am)">⚠ Facture déjà encaissée — modification déconseillée.</div>':'';
+  g('m-body').innerHTML=lock+`
+    <div class="form-group"><label>N° facture</label><input type="text" id="ev-num" value="${v.numero||''}"></div>
+    <div class="form-group"><label>Montant brut (€)</label><input type="number" id="ev-amt" value="${v.montant_ht||0}"></div>
+    <div class="form-group"><label>Statut</label><select id="ev-statut">
+      <option value="brouillon" ${st==='brouillon'?'selected':''}>Brouillon</option>
+      <option value="validee" ${st==='validee'?'selected':''}>Validée</option>
+      <option value="payee" ${st==='payee'?'selected':''}>Payée</option>
+      <option value="cloturee" ${st==='cloturee'?'selected':''}>Clôturée</option>
+    </select></div>
+    <div class="sep"></div>
+    <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:10px">Ventilation</div>
+    <div class="form-group"><label>Gars (terrain)</label><input type="number" id="ev-gars" value="${v.ventil_gars||0}" oninput="evRecalc()"></div>
+    <div class="form-group"><label>Fact. Gars (20% MO)</label><input type="number" id="ev-fg" value="${v.ventil_fact_gars||0}" oninput="evRecalc()"></div>
+    <div class="form-group"><label>Tréso WEC (charges)</label><input type="number" id="ev-treso" value="${v.ventil_treso||0}" oninput="evRecalc()"></div>
+    <div class="form-group"><label>WAL Conseils brut</label><input type="number" id="ev-wal" value="${v.ventil_wal||0}" oninput="evRecalc()"></div>
+    <div class="form-group"><label>Régul URSSAF (sur cette facture)</label><input type="number" id="ev-regul" value="${v.ventil_regul_urssaf||0}" oninput="evRecalc()"></div>
+    <div class="form-group"><label>Famille</label><input type="number" id="ev-fam" value="${v.ventil_famille||0}" oninput="evRecalc()"></div>
+    <div id="ev-recap" class="vp">
+      <div class="vp-row"><span>URSSAF auto (23%)</span><span id="ev-urs">—</span></div>
+      <div class="vp-row"><span>Net Walid</span><span id="ev-net">—</span></div>
+      <div class="vp-row" id="ev-ecart-row"><span>Écart vs montant brut</span><span id="ev-ecart">—</span></div>
+    </div>
+    <div id="ev-overflow" style="margin:10px 0"></div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-nv" onclick="closeModal()" style="flex:1;margin:0">Annuler</button>
+      <button class="btn btn-or" id="ev-save" onclick="saveVente(false)" style="flex:1;margin:0">💾 Enregistrer</button>
+    </div>`;
+  g('modal').classList.add('open');
+  evRecalc();
+}
+function evRecalc(){
+  const amt=parseFloat(g('ev-amt').value)||0;
+  const gars=parseFloat(g('ev-gars').value)||0;
+  const fg=parseFloat(g('ev-fg').value)||0;
+  const treso=parseFloat(g('ev-treso').value)||0;
+  const wal=parseFloat(g('ev-wal').value)||0;
+  const regul=parseFloat(g('ev-regul').value)||0;
+  const fam=parseFloat(g('ev-fam').value)||0;
+  const urs=Math.round(MATH.ventilUrssaf(wal));
+  const net=Math.round(wal-urs-treso-regul);
+  g('ev-urs').textContent=f(urs);
+  g('ev-net').textContent=f(net);
+  const sum=gars+fg+treso+wal+fam;
+  const ecart=amt-sum;
+  if(Math.abs(ecart)>1){
+    g('ev-ecart').textContent=(ecart>0?'+':'')+f(ecart);
+    g('ev-ecart').style.color=ecart>0?'var(--am)':'var(--rd)';
+    g('ev-ecart-row').style.display='flex';
+  } else {
+    g('ev-ecart-row').style.display='none';
+  }
+  // Détection dépassement env_wal (hors facture courante)
+  const ovBox=g('ev-overflow');
+  const check=checkOverflow(_EV_CODE,{ventil_wal:wal},_EV_ID);
+  if(check.overflow){
+    ovBox.innerHTML=`<div style="background:#3d0a0a;border:1px solid var(--rd);border-radius:8px;padding:10px;font-size:12px">
+      <div style="color:var(--rd);font-weight:700;margin-bottom:6px">🔴 Dépassement env. WAL : ${f(check.amount)}</div>
+      <div style="color:var(--am);font-size:11px;margin-bottom:8px">Restant avant cette facture : ${f(check.restant)} · Demandé : ${f(check.proposedWal)}</div>
+      <div style="color:var(--t2);font-size:11px;margin-bottom:8px">Forcer = le net Walid de cette facture absorbe l'écart. Pas d'impact sur les factures suivantes.</div>
+      <button class="btn btn-sm" onclick="saveVente(true)" style="background:#3d0a0a;color:var(--rd);border:1px solid var(--rd);width:100%;margin:0">⚠ Forcer le dépassement (-${f(check.amount)} sur le net)</button>
+    </div>`;
+    g('ev-save').disabled=true;g('ev-save').style.opacity='.4';
+  } else {
+    ovBox.innerHTML='';
+    g('ev-save').disabled=false;g('ev-save').style.opacity='1';
+  }
+}
+async function saveVente(force){
+  const v=DB.ventes.find(x=>x.id===_EV_ID);if(!v)return;
+  const before={statut:v.statut,ventil_gars:v.ventil_gars,ventil_fact_gars:v.ventil_fact_gars,ventil_treso:v.ventil_treso,ventil_wal:v.ventil_wal,ventil_famille:v.ventil_famille,ventil_regul_urssaf:v.ventil_regul_urssaf,ventil_net:v.ventil_net,montant_ht:v.montant_ht,numero:v.numero};
+  const num=g('ev-num').value.trim();
+  const amt=parseFloat(g('ev-amt').value)||0;
+  const statut=g('ev-statut').value;
+  const gars=parseFloat(g('ev-gars').value)||0;
+  const fg=parseFloat(g('ev-fg').value)||0;
+  const treso=parseFloat(g('ev-treso').value)||0;
+  const wal=parseFloat(g('ev-wal').value)||0;
+  const regul=parseFloat(g('ev-regul').value)||0;
+  const fam=parseFloat(g('ev-fam').value)||0;
+  const urs=Math.round(MATH.ventilUrssaf(wal));
+  // Net Walid : si force = on absorbe le dépassement → net réduit du delta
+  const check=checkOverflow(_EV_CODE,{ventil_wal:wal},_EV_ID);
+  const baseNet=wal-urs-treso-regul;
+  const overflowAmt=force&&check.overflow?Math.round(check.amount):0;
+  const net=Math.max(0,Math.round(baseNet-overflowAmt));
+  const patch={
+    numero:num,montant_ht:amt,statut,
+    ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,
+    ventil_urssaf:urs,ventil_regul_urssaf:regul,ventil_famille:fam,ventil_net:net,
+    force_overflow:overflowAmt,
+    paye:(statut==='payee'||statut==='cloturee'),
+    updated_at:new Date().toISOString()
+  };
+  const ok=await sbPatch('wec_ventes',_EV_ID,patch);
+  if(!ok)return;
+  Object.assign(v,patch);
+  logAudit(force?'override_forced':'facture_edited',_EV_CODE,_EV_ID,{before,after:patch,force_overflow:overflowAmt});
+  closeModal();
+  // Refresh la fiche pour montrer la cascade mise à jour
+  const c=DB.chantiers.find(x=>x.code===_EV_CODE||x.id===_EV_CODE);
+  if(c){ouvrirFiche(c.id);}
+  showToast(force?`Forcé : -${f(overflowAmt)} sur le net Walid`:'Facture mise à jour');
 }
 
 function supprimerChantier(cid,nom){
@@ -974,7 +1299,7 @@ function renderURS(){
   const decls=DB.urssaf.filter(u=>u.type==='declaration'||!u.type);
   const paiem=DB.urssaf.filter(u=>u.type==='paiement');
   const totalCA=decls.reduce((s,u)=>s+(u.montant||0),0);
-  const totalUrssaf=Math.round(totalCA*0.212);
+  const totalUrssaf=Math.round(totalCA*URSSAF_RATE);
   const totalPaye=paiem.reduce((s,u)=>s+(u.montant||0),0);
   const aRegulariser=totalUrssaf-totalPaye;
   let html=`
@@ -982,7 +1307,7 @@ function renderURS(){
       <div class="card-title">WAL Conseils — Suivi URSSAF</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
         <div class="kpi"><div class="kpi-label">CA WAL déclaré</div><div class="kpi-val" style="color:var(--or)">${f(totalCA)}</div></div>
-        <div class="kpi"><div class="kpi-label">URSSAF théorique (21,2%)</div><div class="kpi-val" style="color:var(--rd)">${f(totalUrssaf)}</div></div>
+        <div class="kpi"><div class="kpi-label">URSSAF théorique (23%)</div><div class="kpi-val" style="color:var(--rd)">${f(totalUrssaf)}</div></div>
         <div class="kpi"><div class="kpi-label">Payé à l'URSSAF</div><div class="kpi-val" style="color:var(--gn)">${f(totalPaye)}</div></div>
         <div class="kpi" style="border:2px solid ${aRegulariser>0?'var(--rd)':'var(--gn)'}"><div class="kpi-label">À régulariser</div><div class="kpi-val" style="color:${aRegulariser>0?'var(--rd)':'var(--gn)'}">${f(Math.abs(aRegulariser))}</div></div>
       </div>
@@ -998,7 +1323,7 @@ function renderURS(){
       </div>
       ${DB.urssaf.length?[...DB.urssaf].sort((a,b)=>(b.date||b.date_echeance||'')>(a.date||a.date_echeance||'')?1:-1).map(u=>{
         const isDecl=u.type==='declaration'||!u.type;
-        const urssafDu=isDecl?Math.round((u.montant||0)*0.212):0;
+        const urssafDu=isDecl?Math.round((u.montant||0)*URSSAF_RATE):0;
         return`<div class="recap-line">
           <div class="rl-left">
             <div style="font-size:13px;font-weight:700">${isDecl?'Déclaration CA':'Paiement URSSAF'} — ${u.trimestre||u.libelle||''}</div>
@@ -1130,6 +1455,25 @@ function ouvrirWD(cid){
   const np=bud?.net_perso_total||0;
   const netT=fam+np;
   const regleGars=bud?(bud.mo_total||0)+(bud.fact_gars_total||0):0;
+  // v2 : enveloppes prévu/réalisé (vue Walid : pas de détail Gars)
+  const rest=envelopeRestant(c.code||c.id);
+  const envBlock=rest?`<div style="padding:0 16px;margin-bottom:12px">
+    <div style="font-size:11px;font-weight:800;color:var(--or);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Tes enveloppes</div>
+    <div class="wd-synth">
+      ${[
+        ['Gars (prévu)',rest.env_gars_total,rest.env_gars_used],
+        ['WAL Conseils',rest.env_wal_total,rest.env_wal_used],
+        ['Famille',rest.env_famille_total,rest.env_famille_used],
+        ['Régul URSSAF',rest.env_regul_urssaf_total,rest.env_regul_urssaf_used],
+      ].filter(([,t])=>t>0).map(([lab,tot,used])=>{
+        const r=tot-used;
+        const col=r<0?'var(--rd)':(used/tot>0.8?'var(--am)':'var(--gn)');
+        return`<div class="wd-row"><span>${lab}</span>
+          <div style="text-align:right">
+            <div style="font-size:11px;color:var(--t2)">prévu ${f(tot)} · réalisé ${f(used)}</div>
+            <b style="color:${col}">${r>=0?'reste +':''}${f(r)}</b></div></div>`;
+      }).join('')}
+    </div></div>`:'';
   // Accord Walid
   const accordBtn=bud&&!bud.walid_ok
     ?`<div style="padding:16px;background:var(--nv2);border-top:1px solid var(--bd)">
@@ -1144,8 +1488,9 @@ function ouvrirWD(cid){
       <div style="font-size:11px;font-weight:800;color:var(--or);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Tes facturations</div>`;
     ventes.sort((a,b)=>(a.date_facture||'')>(b.date_facture||'')?1:-1).forEach((v,i)=>{
       const net=(v.ventil_net||0)+(v.ventil_famille||0);
-      const statCol=v.paye?'var(--gn)':'var(--am)';
-      const statTxt=v.paye?'✅ Encaissée':'🟠 En attente';
+      const st=v.statut||(v.paye?'payee':'validee');
+      const statCol={brouillon:'var(--t3)',validee:'var(--am)',payee:'var(--gn)',cloturee:'var(--t3)'}[st]||'var(--am)';
+      const statTxt={brouillon:'◇ Brouillon (Marine finalise)',validee:'⊡ Validée — en attente',payee:'✅ Encaissée',cloturee:'🔒 Clôturée'}[st]||'En attente';
       factsHtml+=`<div style="background:var(--nv2);border:1px solid var(--bd);border-radius:10px;margin-bottom:8px;overflow:hidden">
         <div onclick="toggleFact('wf-${i}')" style="display:flex;justify-content:space-between;align-items:center;padding:14px;cursor:pointer">
           <div>
@@ -1170,6 +1515,7 @@ function ouvrirWD(cid){
   }
   let html=`
     <div class="wd-header"><div class="wd-titre">${c.nom}</div><div class="wd-sous">Marché : ${f(c.marche_ht||0)}</div></div>
+    ${envBlock}
     ${regleGars>0?`<div class="wd-regle" style="margin:12px 16px">
       <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:4px">⚠ La règle des gars</div>
       <div style="font-size:13px;color:var(--am)">Budget max : <b>${f(regleGars)}</b><br>Si on dépasse, ton net diminue</div>
@@ -1200,8 +1546,18 @@ function waliderDevis(cid){
   const bud=DB.budgets.find(b=>b.code_chantier===c.code||b.code_chantier===c.id);if(!bud)return;
   confirmDialog('Tu confirmes avoir lu et accepté ce plan financier ?',async()=>{
     const today=new Date().toISOString().slice(0,10);
+    const nowIso=new Date().toISOString();
+    // 1) Stamp budget global (compat existante)
     const ok=await sbPatch('wec_budgets',bud.id,{walid_ok:true,date_walid_ok:today});
-    if(ok){bud.walid_ok=true;bud.date_walid_ok=today;ouvrirWD(cid);showToast('Accord enregistré 👍');}
+    if(!ok)return;
+    bud.walid_ok=true;bud.date_walid_ok=today;
+    // 2) Stamp v2 : toutes les factures validee/payee du projet reçoivent walid_validation_date
+    const factures=DB.ventes.filter(v=>(v.code_chantier===c.code||v.code_chantier===c.id)&&((v.statut||(v.paye?'payee':'validee'))!=='brouillon'));
+    await Promise.all(factures.map(v=>sbPatch('wec_ventes',v.id,{walid_validation_date:nowIso})));
+    factures.forEach(v=>{v.walid_validation_date=nowIso;});
+    // 3) Audit
+    logAudit('walid_ok',c.code||c.id,null,{factures_stampees:factures.length,date:today});
+    ouvrirWD(cid);showToast('Accord enregistré 👍');
   });
 }
 
