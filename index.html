@@ -1491,6 +1491,13 @@ function ouvrirWD(cid){
       const st=v.statut||(v.paye?'payee':'validee');
       const statCol={brouillon:'var(--t3)',validee:'var(--am)',payee:'var(--gn)',cloturee:'var(--t3)'}[st]||'var(--am)';
       const statTxt={brouillon:'◇ Brouillon (Marine finalise)',validee:'⊡ Validée — en attente',payee:'✅ Encaissée',cloturee:'🔒 Clôturée'}[st]||'En attente';
+      const garsNet=v.ventil_gars||0;
+      const factGars=v.ventil_fact_gars||0;
+      const coutGars=garsNet+factGars;
+      const treso=v.ventil_treso||0;
+      const urs=v.ventil_urssaf||0;
+      const regul=v.ventil_regul_urssaf||0;
+      const overflow=v.force_overflow||0;
       factsHtml+=`<div style="background:var(--nv2);border:1px solid var(--bd);border-radius:10px;margin-bottom:8px;overflow:hidden">
         <div onclick="toggleFact('wf-${i}')" style="display:flex;justify-content:space-between;align-items:center;padding:14px;cursor:pointer">
           <div>
@@ -1502,9 +1509,19 @@ function ouvrirWD(cid){
             <div style="font-size:10px;color:var(--t2)">Pour toi : ${f(net)}</div>
           </div>
         </div>
-        <div id="wf-${i}" class="hidden" style="padding:0 14px 14px;border-top:1px solid var(--bd)">
+        <div id="wf-${i}" class="hidden" style="padding:10px 14px 14px;border-top:1px solid var(--bd)">
+          ${coutGars>0?`<div style="background:var(--gy);border-radius:8px;padding:10px;margin-bottom:10px">
+            <div style="font-size:11px;font-weight:800;color:var(--or);margin-bottom:6px">👷 Les gars sur cette facture</div>
+            <div class="wd-row"><span>Salaire net (ce qu'ils touchent)</span><b style="color:var(--or)">${f(garsNet)}</b></div>
+            <div class="wd-row"><span>Facture GARS (charge en plus)</span><b style="color:var(--rd)">${f(factGars)}</b></div>
+            <div class="wd-row" style="border-top:1px solid var(--bd);padding-top:8px;margin-top:4px"><span><b>Total qui sort pour les gars</b></span><b>${f(coutGars)}</b></div>
+          </div>`:''}
+          ${treso>0?`<div class="wd-row"><span>🏢 Tréso WEC (charges)</span><b style="color:var(--t2)">${f(treso)}</b></div>`:''}
+          ${urs>0?`<div class="wd-row"><span>🧾 URSSAF (23%)</span><b style="color:var(--rd)">${f(urs)}</b></div>`:''}
+          ${regul>0?`<div class="wd-row"><span>↩ Régul URSSAF</span><b style="color:var(--rd)">${f(regul)}</b></div>`:''}
           ${(v.ventil_famille||0)>0?`<div class="wd-row"><span>👨‍👩‍👧 Famille</span><b style="color:#60a5fa">${f(v.ventil_famille)}</b></div>`:''}
-          <div class="wd-row"><span>💰 Ton net perso</span><b style="color:var(--gn)">${f(v.ventil_net||0)}</b></div>
+          <div class="wd-row" style="border-top:1px solid var(--bd);padding-top:8px;margin-top:4px"><span><b>💰 Ton net perso</b></span><b style="color:var(--gn);font-size:15px">${f(v.ventil_net||0)}</b></div>
+          ${overflow>0?`<div style="font-size:10px;color:var(--rd);margin-top:6px;font-weight:700">⚠ Marine a forcé un dépassement de ${f(overflow)} sur ton net</div>`:''}
           <div style="font-size:10px;color:var(--t2);margin-top:6px">Marché facturé : ${f(v.montant_ht)}</div>
         </div>
       </div>`;
@@ -1517,8 +1534,11 @@ function ouvrirWD(cid){
     <div class="wd-header"><div class="wd-titre">${c.nom}</div><div class="wd-sous">Marché : ${f(c.marche_ht||0)}</div></div>
     ${envBlock}
     ${regleGars>0?`<div class="wd-regle" style="margin:12px 16px">
-      <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:4px">⚠ La règle des gars</div>
-      <div style="font-size:13px;color:var(--am)">Budget max : <b>${f(regleGars)}</b><br>Si on dépasse, ton net diminue</div>
+      <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:8px">👷 La règle des gars (budget max)</div>
+      <div class="wd-row" style="border-color:#3d2200"><span style="color:var(--am)">Salaire net (ce qu'ils touchent)</span><b style="color:var(--or)">${f(bud?.mo_total||0)}</b></div>
+      <div class="wd-row" style="border-color:#3d2200"><span style="color:var(--am)">Facture GARS (charge en plus)</span><b style="color:var(--rd)">${f(bud?.fact_gars_total||0)}</b></div>
+      <div class="wd-row" style="border:none;padding-top:8px;margin-top:4px;border-top:1px solid #3d2200"><span style="color:var(--am)"><b>Total qui sort de ta poche</b></span><b style="color:var(--am);font-size:15px">${f(regleGars)}</b></div>
+      <div style="font-size:11px;color:var(--am);margin-top:8px">Si on dépasse, ton net perso diminue d'autant</div>
     </div>`:''}
     ${factsHtml}
     ${netT>0?`<div class="wd-objectif" style="margin:0 16px 12px">
