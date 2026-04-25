@@ -135,15 +135,48 @@ Barres de progression **Famille** et **Net perso** :
 
 ---
 
-## 5. Points à clarifier / Dette technique
+## 5. Cascade automatique (lot 2)
+
+`recalcCascade(code)` rebalance automatiquement après chaque save (création ou édition de virement).
+
+Algorithme :
+1. Récupère tous les virements du chantier.
+2. Sépare `locked` (paye=true, intouchables) et `pending` (paye=false).
+3. Reste à ventiler par poste = enveloppe - somme ventil des `locked`.
+4. Pour chaque virement pending : pro-rata sur son montant relatif au total pending.
+5. PATCH chaque pending modifié en parallèle.
+
+Trigger : après chaque `sbPost`/`sbPatch` sur `wec_ventes`. Toast "cascade rééquilibrée sur N virement(s)" si N>0.
+
+Conséquence : à la fin du chantier (tous les virements encaissés), la somme des ventil_* tombe pile sur les enveloppes prévues.
+
+## 6. URSSAF auto-agrégation par mois (lot 2)
+
+Plus besoin de "Déclaration CA" manuelle. L'URSSAF lit directement `ventil_wal` des virements `paye=true` :
+- Agrégation par mois (`date_paiement` ou fallback `date_facture`).
+- Affichage : 1 carte par mois avec CA WAL + URSSAF due.
+- Déclaration mensuelle, paiement trimestriel (avec demande mensuel en cours côté Marine).
+- Le bouton "+ Régul antériorité" reste pour saisir les périodes pré-app.
+
+## 7. Vue Walid refondue "scolaire maternelle" (lot 2)
+
+3 blocs séquentiels lecture seule :
+- **🎯 Le plan validé** — 6 enveloppes (gars, fact GARS, tréso société, URSSAF, famille, net) avec icônes, montants, et notes pédagogiques. Cadenas vert si `walid_ok=true`.
+- **✅ Règlements déjà reçus** — pour chaque virement encaissé : "Le DD/MM, virement de X € → versé aux gars / fact GARS / tréso / URSSAF / famille / pour toi".
+- **⏳ Reste à recevoir** — agrégation des virements en attente, même décomposition pédagogique, gros chiffre vert "💰 Pour toi (net à venir) : X €".
+
+Plus de toggle/accordéon. Tout est déplié, lisible, verrouillé.
+
+## 8. Points à clarifier / Dette technique
 
 | Sujet | Action |
 |---|---|
 | Historique audit ventilation | Pas implémenté — la PATCH écrase. À prévoir : table `wec_ventes_historique` avec trigger ou snapshot manuel. |
 | Seuil d'alerte personnalisable | Actuellement 20 % du budget initial déclenche l'orange. Constante à externaliser dans settings. |
 | Export CSV Dougs | Non implémenté dans ce lot. |
-| Suppression facture | Non modifiée — toujours suppression brute sans recalc explicite. Les enveloppes suivantes se recalculent au rechargement. |
-| Pagination factures 100+ | Pas nécessaire aujourd'hui (WEC = 4-5 factures/an/chantier). À traiter si volume explose. |
+| Suppression facture | Non modifiée — la cascade se recalcule au rechargement après suppression. |
+| Pagination factures 100+ | Pas nécessaire aujourd'hui. |
+| Bascule mensuel/trimestriel URSSAF | Marine a fait la demande URSSAF. Quand validé, ajouter un toggle dans les settings pour générer les échéances en mode mensuel. |
 
 ---
 

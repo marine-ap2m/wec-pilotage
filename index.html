@@ -403,6 +403,51 @@ function consomme(code,excludeId){
   };
 }
 
+// Cascade automatique : rééquilibre les virements en attente (paye=false) d'un chantier
+// pour que la somme totale colle aux enveloppes prévues. Les payés sont verrouillés.
+async function recalcCascade(code){
+  const c=DB.chantiers.find(x=>x.code===code||x.id===code);if(!c)return 0;
+  const bud=DB.budgets.find(b=>matchCh(b,c));if(!bud)return 0;
+  const env=envBud(bud);
+  const all=DB.ventes.filter(v=>v.code_chantier===code);
+  const locked=all.filter(v=>v.paye);
+  const pending=all.filter(v=>!v.paye).sort((a,b)=>(a.date_facture||'')<(b.date_facture||'')?-1:1);
+  if(!pending.length)return 0;
+  // Reste à ventiler par poste = enveloppe - somme des ventils des payés
+  const consoLocked={
+    gars:locked.reduce((s,v)=>s+(v.ventil_gars||0),0),
+    fact_gars:locked.reduce((s,v)=>s+(v.ventil_fact_gars||0),0),
+    treso:locked.reduce((s,v)=>s+(v.ventil_treso||0),0),
+    wal:locked.reduce((s,v)=>s+(v.ventil_wal||0),0),
+    urssaf:locked.reduce((s,v)=>s+(v.ventil_urssaf||0),0),
+    famille:locked.reduce((s,v)=>s+(v.ventil_famille||0),0),
+    net:locked.reduce((s,v)=>s+(v.ventil_net||0),0),
+  };
+  const sumPending=pending.reduce((s,v)=>s+(v.montant_ht||0),0);
+  if(sumPending<=0)return 0;
+  // Pour chaque virement en attente : pro-rata sur son montant relatif
+  const patches=[];
+  pending.forEach(v=>{
+    const r=v.montant_ht/sumPending;
+    const gars=Math.round(Math.max(0,(env.mo-consoLocked.gars))*r);
+    const fact_gars=Math.round(gars*0.20);
+    const treso=Math.round(Math.max(0,(env.treso-consoLocked.treso))*r);
+    const fam=Math.round(Math.max(0,(env.famille-consoLocked.famille))*r);
+    const wal=Math.max(0,v.montant_ht-gars-fact_gars-treso);
+    const urs=Math.round(wal*0.212);
+    const net=Math.max(0,Math.round(wal*0.75-fam));
+    // Skip si pas de changement
+    if(v.ventil_gars===gars&&v.ventil_fact_gars===fact_gars&&v.ventil_treso===treso&&
+       v.ventil_wal===wal&&v.ventil_urssaf===urs&&v.ventil_famille===fam&&v.ventil_net===net)return;
+    const patch={ventil_gars:gars,ventil_fact_gars:fact_gars,ventil_treso:treso,
+      ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
+    Object.assign(v,patch);
+    patches.push(sbPatch('wec_ventes',v.id,patch));
+  });
+  if(patches.length)await Promise.all(patches);
+  return patches.length;
+}
+
 function showToast(msg,type='ok',dur=2800){
   const t=g('toast');
   t.textContent=msg;
@@ -1025,20 +1070,30 @@ async function save(type){
       if(env.net>0&&(cons.net+net)>env.net)dep.push('Net perso');
       if(dep.length)depassMsg=`⚠ Dépassement ${dep.join(', ')}`;
     }
+    const codeCh=cid;
     if(_EDIT_VENTE_ID){
       const patch={date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,
         ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
       const ok=await sbPatch('wec_ventes',_EDIT_VENTE_ID,patch);
       if(ok){
         const v=DB.ventes.find(x=>x.id===_EDIT_VENTE_ID);if(v)Object.assign(v,patch);
+        const nbCascade=await recalcCascade(codeCh);
         const cOpen=_chSel();closeModal();renderBord();if(PROFIL==='marine')renderMvt();
         if(cOpen)ouvrirFiche(cOpen.id);
-        showToast(depassMsg||'Ventilation mise à jour',depassMsg?'warn':'ok');
+        const msg=depassMsg||(nbCascade>0?`Ventilation mise à jour · cascade rééquilibrée sur ${nbCascade} virement(s)`:'Ventilation mise à jour');
+        showToast(msg,depassMsg?'warn':'ok');
       }
     } else {
       const row={id:uid(),code_chantier:cid,date_facture:date,numero:num,montant_ht:amt,paye,date_paiement:paye?date:null,categorie:'facture_vente',
         ventil_gars:gars,ventil_fact_gars:fg,ventil_treso:treso,ventil_wal:wal,ventil_urssaf:urs,ventil_famille:fam,ventil_net:net};
-      const r=await sbPost('wec_ventes',row);if(r){DB.ventes.unshift(row);closeModal();renderBord();if(PROFIL==='marine')renderMvt();showToast(depassMsg||'Facture enregistrée',depassMsg?'warn':'ok');}
+      const r=await sbPost('wec_ventes',row);
+      if(r){
+        DB.ventes.unshift(row);
+        const nbCascade=await recalcCascade(codeCh);
+        closeModal();renderBord();if(PROFIL==='marine')renderMvt();
+        const msg=depassMsg||(nbCascade>0?`Virement enregistré · cascade rééquilibrée sur ${nbCascade} virement(s) en attente`:'Virement enregistré');
+        showToast(msg,depassMsg?'warn':'ok');
+      }
     }
   } else if(type==='gars'){
     const mo=parseFloat(g('m-mo').value)||0;if(!mo){showToast('Montant requis','err');return;}
@@ -1122,31 +1177,70 @@ async function changerStatut(cid,statut){
 // ─── NAV WALID ───
 // ─── URSSAF ───
 function renderURS(){
-  // CA WAL Conseils = toutes les ventes wec_walid_net categorie urssaf = virements URSSAF
-  // wec_urssaf = declarations trimestrielles CA + paiements
-  const decls=DB.urssaf.filter(u=>u.type==='declaration'||!u.type);
+  // CA WAL Conseils = brut WAL = somme ventil_wal des virements encaissés
+  // Agrégation automatique par mois pour déclaration mensuelle (paiement trimestriel)
+  const ventesPayees=DB.ventes.filter(v=>v.paye&&(v.ventil_wal||0)>0);
+  const caParMois={}; // {YYYY-MM: {ca, urssaf, ventes:[...]}}
+  ventesPayees.forEach(v=>{
+    const ym=(v.date_paiement||v.date_facture||'').slice(0,7);
+    if(!ym)return;
+    if(!caParMois[ym])caParMois[ym]={ca:0,urssaf:0,ventes:[]};
+    caParMois[ym].ca+=v.ventil_wal||0;
+    caParMois[ym].urssaf+=v.ventil_urssaf||0;
+    caParMois[ym].ventes.push(v);
+  });
+  const moisKeys=Object.keys(caParMois).sort().reverse();
+  const totalCA=ventesPayees.reduce((s,v)=>s+(v.ventil_wal||0),0);
+  const totalUrssafAuto=ventesPayees.reduce((s,v)=>s+(v.ventil_urssaf||0),0);
+  // Régul URSSAF manuelles (ancien système, encore utiles pour antériorité)
+  const declsManu=DB.urssaf.filter(u=>u.type==='declaration'||!u.type);
+  const totalCAmanu=declsManu.reduce((s,u)=>s+(u.montant||0),0);
+  const totalUrssafManu=Math.round(totalCAmanu*0.212);
+  // Paiements URSSAF effectifs
   const paiem=DB.urssaf.filter(u=>u.type==='paiement');
-  const totalCA=decls.reduce((s,u)=>s+(u.montant||0),0);
-  const totalUrssaf=Math.round(totalCA*0.212);
   const totalPaye=paiem.reduce((s,u)=>s+(u.montant||0),0);
-  const aRegulariser=totalUrssaf-totalPaye;
+  const totalDu=totalUrssafAuto+totalUrssafManu;
+  const aRegulariser=totalDu-totalPaye;
+  // Format mois lisible
+  const fMois=ym=>{
+    if(!ym||ym.length<7)return ym||'';
+    const m=['janv.','févr.','mars','avr.','mai','juin','juil.','août','sept.','oct.','nov.','déc.'];
+    return m[parseInt(ym.slice(5,7))-1]+' '+ym.slice(0,4);
+  };
   let html=`
     <div class="card">
       <div class="card-title">WAL Conseils — Suivi URSSAF</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
-        <div class="kpi"><div class="kpi-label">CA WAL déclaré</div><div class="kpi-val" style="color:var(--or)">${f(totalCA)}</div></div>
-        <div class="kpi"><div class="kpi-label">URSSAF théorique (21,2%)</div><div class="kpi-val" style="color:var(--rd)">${f(totalUrssaf)}</div></div>
+        <div class="kpi"><div class="kpi-label">CA WAL encaissé</div><div class="kpi-val" style="color:var(--or)">${f(totalCA+totalCAmanu)}</div></div>
+        <div class="kpi"><div class="kpi-label">URSSAF due (21,2%)</div><div class="kpi-val" style="color:var(--rd)">${f(totalDu)}</div></div>
         <div class="kpi"><div class="kpi-label">Payé à l'URSSAF</div><div class="kpi-val" style="color:var(--gn)">${f(totalPaye)}</div></div>
-        <div class="kpi" style="border:2px solid ${aRegulariser>0?'var(--rd)':'var(--gn)'}"><div class="kpi-label">À régulariser</div><div class="kpi-val" style="color:${aRegulariser>0?'var(--rd)':'var(--gn)'}">${f(Math.abs(aRegulariser))}</div></div>
+        <div class="kpi" style="border:2px solid ${aRegulariser>0?'var(--rd)':'var(--gn)'}"><div class="kpi-label">${aRegulariser>0?'Reste à payer':'Excédent payé'}</div><div class="kpi-val" style="color:${aRegulariser>0?'var(--rd)':'var(--gn)'}">${f(Math.abs(aRegulariser))}</div></div>
       </div>
-      ${aRegulariser>0?`<div class="alerte-box">⚠️ Régularisation à prévoir : ${f(aRegulariser)} — à absorber sur le prochain chantier</div>`:''}
+      ${aRegulariser>0?`<div class="alerte-box">⚠️ Reste à provisionner : ${f(aRegulariser)} — à payer aux échéances URSSAF</div>`:''}
+      <div style="font-size:10px;color:var(--t3);margin-top:8px;line-height:1.5">📌 Le CA WAL est calculé automatiquement à partir des virements encaissés (champ <code>ventil_wal</code>). Déclaration mensuelle, paiement trimestriel par défaut.</div>
+    </div>
+    <div class="card">
+      <div class="card-title">CA WAL par mois (auto, à déclarer)</div>
+      ${moisKeys.length?moisKeys.map(ym=>{
+        const m=caParMois[ym];
+        return`<div style="background:var(--gy);border-radius:8px;padding:12px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-size:13px;font-weight:800">${fMois(ym)}</div>
+            <div style="text-align:right">
+              <div style="font-size:16px;font-weight:800;color:var(--or)">${f(m.ca)}</div>
+              <div style="font-size:10px;color:var(--rd)">URSSAF : ${f(m.urssaf)}</div>
+            </div>
+          </div>
+          <div style="font-size:10px;color:var(--t3)">${m.ventes.length} virement${m.ventes.length>1?'s':''} encaissé${m.ventes.length>1?'s':''}</div>
+        </div>`;
+      }).join(''):'<div class="empty" style="padding:14px">Aucun virement encaissé. Le CA WAL sera calculé dès que tu marqueras des virements comme « encaissés ».</div>'}
     </div>
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <div class="card-title" style="margin:0">Mouvements URSSAF</div>
+        <div class="card-title" style="margin:0">Paiements & régul manuelles</div>
         <div style="display:flex;gap:6px">
-          <button class="btn btn-or btn-sm" onclick="saisirURS('declaration')" style="width:auto">+ Déclaration CA</button>
           <button class="btn btn-nv btn-sm" onclick="saisirURS('paiement')" style="width:auto">+ Paiement</button>
+          <button class="btn btn-or btn-sm" onclick="saisirURS('declaration')" style="width:auto">+ Régul antériorité</button>
         </div>
       </div>
       ${DB.urssaf.length?[...DB.urssaf].sort((a,b)=>(b.date||b.date_echeance||'')>(a.date||a.date_echeance||'')?1:-1).map(u=>{
@@ -1154,13 +1248,13 @@ function renderURS(){
         const urssafDu=isDecl?Math.round((u.montant||0)*0.212):0;
         return`<div class="recap-line">
           <div class="rl-left">
-            <div style="font-size:13px;font-weight:700">${isDecl?'Déclaration CA':'Paiement URSSAF'} — ${u.trimestre||u.libelle||''}</div>
+            <div style="font-size:13px;font-weight:700">${isDecl?'Régul CA antériorité':'Paiement URSSAF'} — ${u.trimestre||u.libelle||''}</div>
             <div class="rl-date">${fDate(u.date||u.date_echeance)}</div>
             ${isDecl?`<div style="font-size:10px;color:var(--rd)">URSSAF générée : ${f(urssafDu)}</div>`:''}
           </div>
           <div class="rl-montant" style="color:${isDecl?'var(--or)':'var(--gn)'}">${isDecl?'+':'-'}${f(u.montant)}</div>
         </div>`;
-      }).join(''):`<div class="empty">Aucun mouvement. Commencez par saisir une déclaration de CA.</div>`}
+      }).join(''):`<div class="empty" style="padding:14px">Aucune saisie manuelle.</div>`}
     </div>`;
   g('urs-content').innerHTML=html;
 }
@@ -1278,93 +1372,118 @@ function renderWC(){
 function ouvrirWD(cid){
   const c=DB.chantiers.find(x=>x.id===cid);if(!c)return;
   const bud=DB.budgets.find(b=>matchCh(b,c));
-  const ventes=DB.ventes.filter(v=>matchCh(v,c));
-  const fam=bud?.famille_total||0;
-  const np=bud?.net_perso_total||0;
-  const netT=fam+np;
-  const regleGars=bud?(bud.mo_total||0)+(bud.fact_gars_total||0):0;
-  // Accord Walid
+  const ventes=DB.ventes.filter(v=>matchCh(v,c)).sort((a,b)=>(a.date_facture||'')<(b.date_facture||'')?-1:1);
+  const env=bud?envBud(bud):null;
+  const totalMarche=(c.marche_ht||0)+(c.avenant_ht||0);
+
+  // ─── BLOC 1 — ENVELOPPES PRÉVUES (verrouillées, pédagogique)
+  let blocEnv='';
+  if(env){
+    const lock=bud.walid_ok?`<span style="color:var(--gn);font-size:11px;font-weight:700">🔒 Validé par Marine le ${fDate(bud.date_walid_ok)}</span>`:`<span style="color:var(--am);font-size:11px;font-weight:700">⏳ Plan en attente de ton accord</span>`;
+    const eRow=(emoji,lab,val,col,note)=>val>0?`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--bd)">
+        <div><div style="font-size:13px;font-weight:700">${emoji} ${lab}</div>${note?`<div style="font-size:10px;color:var(--t3);margin-top:2px">${note}</div>`:''}</div>
+        <b style="color:${col};font-size:15px">${f(val)}</b>
+      </div>`:'';
+    blocEnv=`<div class="wd-sec">
+      <div class="wd-sec-title">🎯 Le plan validé pour ce chantier</div>
+      <div class="wd-synth">
+        <div style="margin-bottom:10px">${lock}</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:2px solid var(--or);margin-bottom:4px">
+          <span style="font-size:13px;font-weight:800">Marché total signé</span>
+          <b style="color:var(--or);font-size:17px">${f(totalMarche)}</b>
+        </div>
+        ${eRow('👷','Aux gars (paiement chantier)',env.mo,'var(--or)','MO terrain net')}
+        ${eRow('🧾','Facture GARS (20%)',env.fact_gars,'var(--or)','Société de comptabilité')}
+        ${eRow('🏢','Trésorerie société',env.treso,'var(--t2)','Charges fixes (Qonto, Dougs, AP2M, assurance)')}
+        ${eRow('📋','Provision URSSAF',env.urssaf,'var(--rd)','Cotisations 21,2% sur ton brut WAL Conseils')}
+        ${eRow('👨‍👩‍👧','Famille',env.famille,'#60a5fa','Pour toi et ta famille')}
+        ${eRow('💰','Net pour toi',env.net,'var(--gn)','Ton net perso après URSSAF')}
+      </div>
+    </div>`;
+  }
+
+  // ─── BLOC 2 — RÈGLEMENTS REÇUS (déjà perçus, ventilation détaillée pédagogique)
+  const ventesPaid=ventes.filter(v=>v.paye);
+  let blocRecus='';
+  if(ventesPaid.length){
+    blocRecus=`<div class="wd-sec">
+      <div class="wd-sec-title">✅ Règlements déjà reçus (${ventesPaid.length})</div>`;
+    ventesPaid.forEach(v=>{
+      const dRow=(emoji,lab,val,col)=>val>0?`<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:12px"><span style="color:var(--t2)">${emoji} ${lab}</span><b style="color:${col}">${f(val)}</b></div>`:'';
+      blocRecus+=`<div class="wd-fact" style="border:1px solid var(--gn)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--bd)">
+          <div>
+            <div style="font-size:13px;font-weight:800">Le ${fDate(v.date_facture)}</div>
+            <div style="font-size:10px;color:var(--gn);margin-top:2px">✅ Encaissé · ${v.numero||''}</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:10px;color:var(--t3)">Virement reçu</div>
+            <div style="font-size:20px;font-weight:800;color:var(--gn)">${f(v.montant_ht)}</div>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--t2);margin-bottom:6px;font-weight:700">→ Sur ce virement, voici où va l'argent :</div>
+        ${dRow('👷','Versé aux gars',v.ventil_gars,'var(--or)')}
+        ${dRow('🧾','Facture GARS',v.ventil_fact_gars,'var(--or)')}
+        ${dRow('🏢','Trésorerie société',v.ventil_treso,'var(--t2)')}
+        ${dRow('📋','Provision URSSAF',v.ventil_urssaf,'var(--rd)')}
+        ${dRow('👨‍👩‍👧','Famille',v.ventil_famille,'#60a5fa')}
+        <div style="display:flex;justify-content:space-between;padding:7px 0 0;margin-top:6px;border-top:1px solid var(--bd);font-size:13px"><span style="font-weight:700">💰 Pour toi (net)</span><b style="color:var(--gn);font-size:15px">${f(v.ventil_net||0)}</b></div>
+      </div>`;
+    });
+    blocRecus+=`</div>`;
+  }
+
+  // ─── BLOC 3 — RESTE À RECEVOIR (virements en attente, agrégés pédagogique)
+  const ventesPending=ventes.filter(v=>!v.paye);
+  let blocReste='';
+  if(env){
+    const tot={
+      gars:ventesPending.reduce((s,v)=>s+(v.ventil_gars||0),0),
+      fact_gars:ventesPending.reduce((s,v)=>s+(v.ventil_fact_gars||0),0),
+      treso:ventesPending.reduce((s,v)=>s+(v.ventil_treso||0),0),
+      wal:ventesPending.reduce((s,v)=>s+(v.ventil_wal||0),0),
+      urssaf:ventesPending.reduce((s,v)=>s+(v.ventil_urssaf||0),0),
+      famille:ventesPending.reduce((s,v)=>s+(v.ventil_famille||0),0),
+      net:ventesPending.reduce((s,v)=>s+(v.ventil_net||0),0),
+    };
+    const totMontant=ventesPending.reduce((s,v)=>s+(v.montant_ht||0),0);
+    if(ventesPending.length>0){
+      const rRow=(emoji,lab,val,col)=>val>0?`<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:12px"><span style="color:var(--t2)">${emoji} ${lab}</span><b style="color:${col}">${f(val)}</b></div>`:'';
+      blocReste=`<div class="wd-sec">
+        <div class="wd-sec-title">⏳ Reste à recevoir (${ventesPending.length} virement${ventesPending.length>1?'s':''} prévu${ventesPending.length>1?'s':''})</div>
+        <div class="wd-synth" style="border:2px solid var(--am)">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;border-bottom:2px solid var(--bd);margin-bottom:8px">
+            <span style="font-size:13px;font-weight:800">Total à percevoir</span>
+            <b style="color:var(--am);font-size:20px">${f(totMontant)}</b>
+          </div>
+          <div style="font-size:11px;color:var(--t2);margin-bottom:6px;font-weight:700">→ Quand ces virements tomberont, voici la répartition :</div>
+          ${rRow('👷','Aux gars',tot.gars,'var(--or)')}
+          ${rRow('🧾','Facture GARS',tot.fact_gars,'var(--or)')}
+          ${rRow('🏢','Trésorerie société',tot.treso,'var(--t2)')}
+          ${rRow('📋','Provision URSSAF',tot.urssaf,'var(--rd)')}
+          ${rRow('👨‍👩‍👧','Famille',tot.famille,'#60a5fa')}
+          <div style="display:flex;justify-content:space-between;padding:8px 0 0;margin-top:6px;border-top:1px solid var(--bd);font-size:14px"><span style="font-weight:800">💰 Pour toi (net à venir)</span><b style="color:var(--gn);font-size:18px">${f(tot.net)}</b></div>
+        </div>
+      </div>`;
+    } else if(ventesPaid.length>0) {
+      blocReste=`<div class="wd-sec"><div class="wd-synth" style="border:2px solid var(--gn);text-align:center;padding:18px"><div style="font-size:14px;font-weight:800;color:var(--gn)">🎉 Tous les virements de ce chantier sont encaissés</div></div></div>`;
+    }
+  }
+
+  // ─── Accord Walid (en bas, après avoir tout vu)
   const accordBtn=bud&&!bud.walid_ok
     ?`<div style="padding:16px;background:var(--nv2);border-top:1px solid var(--bd)">
         <button onclick="waliderDevis('${c.id}')" style="width:100%;padding:16px;background:var(--or);border:none;border-radius:10px;color:#fff;font-size:15px;font-weight:800;cursor:pointer;font-family:inherit">👍 Je suis OK avec ce plan</button>
         <div style="font-size:10px;color:var(--t2);text-align:center;margin-top:6px">Marine sera notifiée de ton accord</div>
       </div>`
-    :(bud?.walid_ok?`<div style="padding:12px 16px;font-size:12px;color:var(--gn);text-align:center;font-weight:700;border-top:1px solid var(--bd)">👍 Tu as donné ton accord le ${fDate(bud.date_walid_ok)}</div>`:'');
-  // Factures accordéon
-  let factsHtml='';
-  if(ventes.length){
-    factsHtml=`<div style="padding:0 16px;margin-bottom:12px">
-      <div style="font-size:11px;font-weight:800;color:var(--or);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Tes facturations</div>`;
-    ventes.sort((a,b)=>(a.date_facture||'')>(b.date_facture||'')?1:-1).forEach((v,i)=>{
-      const net=(v.ventil_net||0)+(v.ventil_famille||0);
-      const statCol=v.paye?'var(--gn)':'var(--am)';
-      const statTxt=v.paye?'✅ Encaissée':'🟠 En attente';
-      factsHtml+=`<div style="background:var(--nv2);border:1px solid var(--bd);border-radius:10px;margin-bottom:8px;overflow:hidden">
-        <div onclick="toggleFact('wf-${i}')" style="display:flex;justify-content:space-between;align-items:center;padding:14px;cursor:pointer">
-          <div>
-            <div style="font-size:14px;font-weight:800">${v.numero||'Facture '+(i+1)}</div>
-            <div style="font-size:11px;color:${statCol};margin-top:2px">${statTxt}</div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-size:18px;font-weight:800;color:${v.paye?'var(--gn)':'var(--am)'}">${f(v.montant_ht)}</div>
-            <div style="font-size:10px;color:var(--t2)">Pour toi : ${f(net)}</div>
-          </div>
-        </div>
-        <div id="wf-${i}" class="hidden" style="padding:0 14px 14px;border-top:1px solid var(--bd)">
-          ${(v.ventil_famille||0)>0?`<div class="wd-row"><span>👨‍👩‍👧 Famille</span><b style="color:#60a5fa">${f(v.ventil_famille)}</b></div>`:''}
-          <div class="wd-row"><span>💰 Ton net perso</span><b style="color:var(--gn)">${f(v.ventil_net||0)}</b></div>
-          <div style="font-size:10px;color:var(--t2);margin-top:6px">Marché facturé : ${f(v.montant_ht)}</div>
-        </div>
-      </div>`;
-    });
-    factsHtml+=`</div>`;
-  } else {
-    factsHtml=`<div style="padding:0 16px 16px"><div class="empty" style="padding:20px">Aucune facture enregistrée</div></div>`;
-  }
-  // Barres progression enveloppes (famille + net perso réalisés vs prévus)
-  let barsHtml='';
-  if(bud){
-    const famEnc=ventes.filter(v=>v.paye).reduce((s,v)=>s+(v.ventil_famille||0),0);
-    const famAtt=ventes.filter(v=>!v.paye).reduce((s,v)=>s+(v.ventil_famille||0),0);
-    const netEnc=ventes.filter(v=>v.paye).reduce((s,v)=>s+(v.ventil_net||0),0);
-    const netAtt=ventes.filter(v=>!v.paye).reduce((s,v)=>s+(v.ventil_net||0),0);
-    const bar=(label,enc,att,budget,col)=>{
-      if(budget<=0)return '';
-      const pEnc=Math.min(100,budget>0?enc/budget*100:0);
-      const pAtt=Math.min(100-pEnc,budget>0?att/budget*100:0);
-      return`<div style="margin-bottom:14px">
-        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">
-          <span style="font-weight:700">${label}</span>
-          <span style="color:var(--t2)">${f(enc)} / ${f(budget)}</span>
-        </div>
-        <div style="background:var(--gy);border-radius:6px;height:10px;overflow:hidden;display:flex">
-          <div style="width:${pEnc}%;background:${col}"></div>
-          <div style="width:${pAtt}%;background:${col};opacity:.4"></div>
-        </div>
-        ${att>0?`<div style="font-size:10px;color:var(--t2);margin-top:3px">${f(att)} en attente de règlement</div>`:''}
-      </div>`;
-    };
-    barsHtml=`<div class="wd-sec">
-      <div class="wd-sec-title">Où j'en suis vs ce qui est prévu</div>
-      <div class="wd-synth">
-        ${fam>0?bar('👨‍👩‍👧 Famille',famEnc,famAtt,fam,'#60a5fa'):''}
-        ${bar('💰 Net perso',netEnc,netAtt,np,'var(--gn)')}
-      </div>
-    </div>`;
-  }
+    :'';
+
   let html=`
-    <div class="wd-header"><div class="wd-titre">${c.nom}</div><div class="wd-sous">${c.code?c.code+' · ':''}Marché : ${f(c.marche_ht||0)}</div></div>
-    ${regleGars>0?`<div class="wd-regle" style="margin:12px 16px">
-      <div style="font-size:12px;font-weight:800;color:var(--or);margin-bottom:4px">⚠ La règle des gars</div>
-      <div style="font-size:13px;color:var(--am)">Budget max : <b>${f(regleGars)}</b><br>Si on dépasse, ton net diminue</div>
-    </div>`:''}
-    ${barsHtml}
-    ${factsHtml}
-    ${netT>0?`<div class="wd-objectif" style="margin:0 16px 12px">
-      <div class="wdo-title">Ton objectif sur ce chantier</div>
-      ${fam>0?`<div style="font-size:18px;font-weight:800;color:#60a5fa;margin-bottom:4px">👨‍👩‍👧 ${f(fam)} pour ta famille</div>`:''}
-      <div style="font-size:26px;font-weight:800;color:var(--gn)">💰 ${f(np)} pour toi</div>
-    </div>`:''}
+    <div class="wd-header"><div class="wd-titre">${c.nom}</div><div class="wd-sous">${c.code?c.code+' · ':''}Marché : ${f(totalMarche)}</div></div>
+    ${blocEnv}
+    ${blocRecus}
+    ${blocReste}
+    ${!ventes.length?`<div class="wd-sec"><div class="empty" style="padding:20px">Aucun virement enregistré pour le moment</div></div>`:''}
     ${accordBtn}
     <div class="wdo-footer-txt">WEC Étanchéité · AP2M Gestion</div>`;
   g('wd-content').innerHTML=html;
